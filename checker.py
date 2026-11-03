@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 # ============================================================
 # CONFIG
@@ -68,7 +69,7 @@ def pick_proxy():
     return None
 
 # ============================================================
-# HELPERS & AUTH CHAIN (same as before)
+# HELPERS & AUTH CHAIN
 # ============================================================
 def decode_jwt_payload(token: str):
     try:
@@ -251,7 +252,8 @@ async def process_combos(combos, chat_id, status_msg, bot):
     try: os.remove(zip_path)
     except: pass
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# Proper aiogram 3.7+ initialization
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 @dp.message(Command("start"))
@@ -304,3 +306,6 @@ async def main():
     
     # Start the bot
     await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
