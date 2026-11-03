@@ -295,13 +295,12 @@ async def web_server():
     log.info(f"Web server started on port {port}")
 
 async def main():
+    # Start web server instantly so Render sees the port open
+    asyncio.create_task(web_server())
+    
     global PROXIES
     PROXIES = await fetch_proxies()
     log.info(f"starting | proxies={len(PROXIES)}")
-    await asyncio.gather(
-        web_server(),
-        dp.start_polling(bot)
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    
+    # Start the bot
+    await dp.start_polling(bot)
